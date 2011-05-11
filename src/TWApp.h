@@ -265,7 +265,7 @@ inline TWApp *TWApp::instance()
 	return theAppInstance;
 }
 
-#ifdef Q_WS_X11
+#if defined(Q_WS_X11) && !defined(Q_WS_MAC)
 #include <QtDBus>
 
 #define TW_SERVICE_NAME 	"org.tug.texworks.application"
