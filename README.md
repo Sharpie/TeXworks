@@ -13,7 +13,7 @@ How to Build
 This fork contains a CMake-based build system that is designed to compile
 TeXworks and optionally package it into a standalone Application for
 redistribution. The CMake system has been tested using the [Homebrew][homebrew]
-to supply dependencies required by TeXwork. Theoretically, dependencies could
+to supply dependencies required by TeXworks. Theoretically, dependencies could
 also be supplied by other package managers such as [MacPorts][macports] or
 [Fink][fink] or by stand alone binaries. This theory has not been tested and
 the build system could require some modification in order to work with other
@@ -36,6 +36,7 @@ brew install cmake
 brew install qt
 brew install hunspell
 brew install --with-qt4 poppler
+brew install lua # Optional---enables TeXworks support for Lua scripts
 
 
 # Now, you should be able to build TeXworks
@@ -46,11 +47,10 @@ mkdir build
 cd build
 
 # Build one for yourself:
-cmake .. -DCMAKE_INSTALL_PREFIX=/Applications
+cmake ..
 make install -j <number of cores on your machine>
 
 # Build one for a friend:
-cmake ..
 make package -j <number of cores on your machine>
 ```
 
