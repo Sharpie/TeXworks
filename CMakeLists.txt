@@ -25,7 +25,7 @@ STRING(REGEX MATCH "([0-9]+)" TeXworks_VER_MINOR ${TeXworks_VER_MINOR})
 FILE(STRINGS ${PROJECT_SOURCE_DIR}/src/TWVersion.h TeXworks_VER_PATCH REGEX "VER_BUGFIX")
 STRING(REGEX MATCH "([0-9]+)" TeXworks_VER_PATCH ${TeXworks_VER_PATCH})
 SET(TeXworks_VERSION ${TeXworks_VER_MAJOR}.${TeXworks_VER_MINOR}.${TeXworks_VER_PATCH})
-MESSAGE(STATUS "TeXworks Major version: ${TeXworks_VERSION}")
+MESSAGE(STATUS "TeXworks Version: ${TeXworks_VERSION}")
 
 # SVN revision
 FILE(STRINGS ${PROJECT_SOURCE_DIR}/src/SvnRev.h TeXworks_SVN_REV LIMIT_COUNT 1)
@@ -41,7 +41,7 @@ MESSAGE(STATUS "TeXworks Git Revision: ${TeXworks_GIT_REV}")
 # Project Options
 # ---------------
 
-SET(TW_BUILD_ID "unknown build" CACHE STRING "A distribution-specific identifier for TeXworks")
+SET(TW_BUILD_ID "personal" CACHE STRING "A distribution-specific identifier for TeXworks")
 
 IF( APPLE AND CMAKE_INSTALL_PREFIX MATCHES "/usr/local" )
   # CMake chooses /usr/local by default, but Mac users probably want things to
