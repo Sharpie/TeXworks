@@ -12,6 +12,10 @@
 #   - TeXworks-specific patches are applied to help Qt apps find the
 #     poppler-data directory.
 #
+#   - Poppler is patched to use native OS X libraries for font handling instead
+#     of Fontconfig. This removes any dependencies on the presence of X11
+#     fonts.
+#
 #   - Poppler is configured to use as few dependencies as possible. This
 #     reduces the number of dylibs that must be added to TeXworks.app when it
 #     is packaged for distribution.
@@ -36,8 +40,9 @@ class Poppler < Formula
   def patches
     {
       :p1 => [
-        DATA,
-        TEXWORKS_PATCH_DIR + 'poppler-qt4-globalparams.patch'
+        TEXWORKS_PATCH_DIR + 'poppler-qt4-globalparams.patch',
+        TEXWORKS_PATCH_DIR + 'poppler-mac-remove-iconv.patch',
+        TEXWORKS_PATCH_DIR + 'poppler-mac-font-handling.patch'
       ]
     }
   end
@@ -51,10 +56,16 @@ class Poppler < Formula
 
   def install
     if ARGV.include? "--with-qt4"
-      qt4Flags = `pkg-config QtCore --libs` + `pkg-config QtGui --libs`
-      qt4Flags.gsub!("\n","")
-      ENV['POPPLER_QT4_CFLAGS'] = qt4Flags
+      ENV['POPPLER_QT4_CFLAGS'] = `pkg-config QtCore QtGui --libs`.chomp.strip
+      ENV.append 'LDFLAGS', "-Wl,-F#{HOMEBREW_PREFIX}/lib"
     end
+
+    # Need to re-generate configure script to take advantage of a patch that
+    # adds native Mac font handling.
+    ENV['ACLOCAL'] = "/usr/bin/aclocal -I#{HOMEBREW_PREFIX}/share/aclocal -I/usr/share/aclocal"
+    ENV['AUTOMAKE'] = '/usr/bin/automake --foreign --add-missing --ignore-deps'
+    system 'touch config.rpath'
+    system '/usr/bin/autoreconf -fi'
 
     args = ["--disable-dependency-tracking", "--prefix=#{prefix}"]
     args << "--disable-poppler-qt4" unless ARGV.include? "--with-qt4"
@@ -64,7 +75,15 @@ class Poppler < Formula
     args.concat [
       '--disable-libpng',
       '--disable-libjpeg',
-      '--disable-cms'
+      '--disable-cms',
+      '--disable-abiword-output',
+      '--disable-cairo-output',
+      '--disable-poppler-glib',
+      '--disable-poppler-cpp',
+      '--disable-gdk',
+      '--disable-utils',
+      '--without-x',
+      '--enable-splash-output' # Required for proper font handling
     ]
 
     system "./configure", *args
@@ -76,18 +95,3 @@ class Poppler < Formula
     end
   end
 end
-
-# fix location of fontconfig, http://www.mail-archive.com/poppler@lists.freedesktop.org/msg03837.html
-__END__
---- a/cpp/Makefile.in	2010-07-08 20:57:56.000000000 +0200
-+++ b/cpp/Makefile.in	2010-08-06 11:11:27.000000000 +0200
-@@ -375,7 +375,8 @@
- INCLUDES = \
- 	-I$(top_srcdir)				\
- 	-I$(top_srcdir)/goo			\
--	-I$(top_srcdir)/poppler
-+	-I$(top_srcdir)/poppler \
-+	$(FONTCONFIG_CFLAGS)
- 
- SUBDIRS = . tests
- poppler_includedir = $(includedir)/poppler/cpp
