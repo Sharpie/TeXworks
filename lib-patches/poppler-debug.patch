@@ -1,0 +1,32 @@
+diff --git a/poppler/GlobalParamsMac.cc b/poppler/GlobalParamsMac.cc
+index fdb10e7..3f1943d 100644
+--- a/poppler/GlobalParamsMac.cc
++++ b/poppler/GlobalParamsMac.cc
+@@ -23,6 +23,9 @@
+ #include <string.h>
+ #include <stdio.h>
+ 
++#include <string>
++#include <iostream>
++
+ #include "goo/gmem.h"
+ #include "goo/GooString.h"
+ #include "goo/GooList.h"
+@@ -55,6 +58,8 @@
+ 
+ GBool GlobalParams::loadPlatformFont(char * fontName) {
+ 
++  std::string debugFontName(fontName);
++
+   char * myName = copyString(fontName);
+   ATSFontRef fontRef = kATSUInvalidFontID;
+   while (1) {
+@@ -100,6 +105,8 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
+     if (FSRefMakePath(&fsRef, fontPath, PATH_MAX) != noErr)
+       break;
+ 
++    std::cerr << "Lookup font: " << debugFontName << " found in file: " << std::string((const char*) fontPath) << std::endl;
++
+     int pathLen = strlen((const char *) fontPath);
+     if (pathLen > 4 && fontPath[pathLen - 4] == '.') {
+       const char * ext = (const char *) fontPath + pathLen - 3;
