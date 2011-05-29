@@ -1,5 +1,5 @@
 diff --git a/poppler/GlobalParamsMac.cc b/poppler/GlobalParamsMac.cc
-index fdb10e7..3f1943d 100644
+index fdb10e7..0352e90 100644
 --- a/poppler/GlobalParamsMac.cc
 +++ b/poppler/GlobalParamsMac.cc
 @@ -23,6 +23,9 @@
@@ -12,7 +12,7 @@ index fdb10e7..3f1943d 100644
  #include "goo/gmem.h"
  #include "goo/GooString.h"
  #include "goo/GooList.h"
-@@ -55,6 +58,8 @@
+@@ -55,8 +58,12 @@
  
  GBool GlobalParams::loadPlatformFont(char * fontName) {
  
@@ -20,13 +20,85 @@ index fdb10e7..3f1943d 100644
 +
    char * myName = copyString(fontName);
    ATSFontRef fontRef = kATSUInvalidFontID;
-   while (1) {
-@@ -100,6 +105,8 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
-     if (FSRefMakePath(&fsRef, fontPath, PATH_MAX) != noErr)
-       break;
- 
-+    std::cerr << "Lookup font: " << debugFontName << " found in file: " << std::string((const char*) fontPath) << std::endl;
++  std::cerr << "Lookup font: " << debugFontName << std::endl;
 +
-     int pathLen = strlen((const char *) fontPath);
-     if (pathLen > 4 && fontPath[pathLen - 4] == '.') {
-       const char * ext = (const char *) fontPath + pathLen - 3;
+   while (1) {
+     CFStringRef psName = CFStringCreateWithCStringNoCopy(kCFAllocatorDefault,
+ 							 myName,
+@@ -82,6 +89,8 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
+   if (fontRef == kATSUInvalidFontID)
+     return gFalse;
+ 
++  std::cerr << "   ATSFontFindFromPostScriptName found fontRef" << std::endl;
++
+   // Currently support only TrueType fonts: check for presence of 'glyf' table
+   // TODO: what about OpenType/CFF? DisplayFontParam doesn't seem to allow for this
+ #define TAG(a,b,c,d) (UInt32)((a)<<24) | (UInt32)((b)<<16) | (UInt32)((c)<<8) | (UInt32)(d)
+@@ -91,6 +100,8 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
+       tableSize == 0)
+     return gFalse;
+ 
++  std::cerr << "   found 'glyf' table" << std::endl;
++
+   do { // if the font comes from a .ttf file, we can use that directly
+     FSRef fsRef;
+     if (ATSFontGetFileReference(fontRef, &fsRef) != noErr)
+@@ -107,6 +118,7 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
+       // accept either .ttf or .otf extension; .otf could contain TrueType-format glyphs
+       if (strcmp(ext, "ttf") == 0 || strcmp(ext, "TTF") == 0 ||
+           strcmp(ext, "otf") == 0 || strcmp(ext, "OTF") == 0) {
++        std:cerr << "   found in file: " << std::string((const char*) fontPath) << std::endl;
+         DisplayFontParam *dfp = new DisplayFontParam(new GooString(fontName), displayFontTT);
+         dfp->setFileName(new GooString((const char *) fontPath));
+         displayFonts->add(dfp->name, dfp);
+@@ -115,6 +127,8 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
+     }
+   } while (0);
+ 
++  std:cerr << "   no TTF file found, checking for .dfont" << std::endl;
++
+   // for .dfont or suitcase files, FoFiTrueType can't handle them, so we extract
+   // the required font to a temporary .ttf file and then use that
+ 
+@@ -138,6 +152,8 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
+   struct sfntHeader * header = (struct sfntHeader *) new Byte[headerSize];
+   ATSFontGetTableDirectory(fontRef, headerSize, (Byte *) header, &headerSize);
+ 
++  std:cerr << "   ATSFontGetTableDirectory succeeded" << std::endl;
++
+ #define READ16(x) (UInt16)(((UInt8*)&(x))[0]<<8) + (UInt16)((UInt8*)&(x))[1]
+ #define READ32(x) (UInt32)(((UInt8*)&(x))[0]<<24) + (UInt32)(((UInt8*)&(x))[1]<<16) + (UInt32)(((UInt8*)&(x))[2]<<8) + (UInt32)((UInt8*)&(x))[3]
+ 
+@@ -146,6 +162,7 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
+ // TODO: figure out whether we can support OpenType/CFF fonts here
+ //      version != TAG('O','T','T','0') &&
+       version != TAG('t','r','u','e')) {
++    std:cerr << "   header->version != 'true'" << std::endl;
+     delete [] (Byte *) header;
+     return gFalse;
+   }
+@@ -177,6 +194,7 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
+   }
+   delete [] (Byte*) header;
+   if (tableIndex < numTables) {
++    std:cerr << "   not enough font tables" << std::endl;
+     delete [] ttfData;
+     return gFalse;
+   }
+@@ -201,6 +219,7 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
+ 
+   char * fontPath = copyString("/tmp/XXXXXXXX.ttf");
+   if (mkstemps(fontPath, 4) == -1) {
++    std:cerr << "   cannot create temporary file" << std::endl;
+     delete [] ttfData;
+     gfree(fontPath);
+     return gFalse;
+@@ -219,6 +238,8 @@ GBool GlobalParams::loadPlatformFont(char * fontName) {
+     return gFalse;
+   }
+ 
++  std:cerr << "   font converted to " << std::string((const char*)fontPath) << std::endl;
++
+   void * p = realloc(tempFontFiles, (numTempFontFiles + 1) * sizeof(char *));
+   if (!p) {
+     unlink(fontPath);
