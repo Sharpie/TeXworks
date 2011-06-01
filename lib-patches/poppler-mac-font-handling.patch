@@ -1,5 +1,5 @@
 diff --git a/configure.ac b/configure.ac
-index 75f173b..6f7f96f 100644
+index 6525203..030cc30 100644
 --- a/configure.ac
 +++ b/configure.ac
 @@ -59,6 +59,9 @@ case "$host_os" in
@@ -48,9 +48,8 @@ index 75f173b..6f7f96f 100644
       AC_DEFINE([WITH_FONTCONFIGURATION_FONTCONFIG],
                 [1],[Use fontconfig font configuration backend])
 diff --git a/m4/mac-framework.m4 b/m4/mac-framework.m4
-new file mode 100644
-index 0000000..8a060ee
---- /dev/null
+index e69de29..8a060ee 100644
+--- a/m4/mac-framework.m4
 +++ b/m4/mac-framework.m4
 @@ -0,0 +1,30 @@
 +# based on kpse-macos-framework.m4 from the TeX Live source tree
@@ -147,11 +146,10 @@ index 941a536..e7bc266 100644
    GBool psShrinkLarger;		// shrink larger pages to fit paper
    GBool psCenter;		// center pages on the paper
 diff --git a/poppler/GlobalParamsMac.cc b/poppler/GlobalParamsMac.cc
-new file mode 100644
-index 0000000..fdb10e7
---- /dev/null
+index e69de29..373021e 100644
+--- a/poppler/GlobalParamsMac.cc
 +++ b/poppler/GlobalParamsMac.cc
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,297 @@
 +//========================================================================
 +//
 +// GlobalParamsMac.cc
@@ -228,6 +226,13 @@ index 0000000..fdb10e7
 +    cp = strrchr(myName, '-');
 +    if (cp) {
 +      *cp = '\0';
++      continue;
++    }
++    if ( strcmp(myName, "ZapfDingbats") == 0 ) {
++      // On OS X 10.5.0 -- 10.6.7 (plus or minus a few versions?) the
++      // PostScript name of ZapfDingbats is ZapfDingbatsITC
++      gfree(myName);
++      myName = copyString("ZapfDingbatsITC");
 +      continue;
 +    }
 +    break;
