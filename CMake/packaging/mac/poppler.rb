@@ -30,9 +30,9 @@ class PopplerData < Formula
 end
 
 class Poppler < Formula
-  url 'http://poppler.freedesktop.org/poppler-0.16.5.tar.gz'
+  url 'http://poppler.freedesktop.org/poppler-0.16.6.tar.gz'
   homepage 'http://poppler.freedesktop.org/'
-  md5 '2b6e0c26b77a943df3b9bb02d67ca236'
+  md5 '592a564fb7075a845f75321ed6425424'
 
   depends_on 'pkg-config' => :build
   depends_on "qt" if ARGV.include? "--with-qt4"
@@ -41,7 +41,6 @@ class Poppler < Formula
     {
       :p1 => [
         TEXWORKS_PATCH_DIR + 'poppler-qt4-globalparams.patch',
-        TEXWORKS_PATCH_DIR + 'poppler-mac-remove-iconv.patch',
         TEXWORKS_PATCH_DIR + 'poppler-mac-font-handling.patch',
         TEXWORKS_PATCH_DIR + 'poppler-debug-mac-font-handling.patch'
       ]
@@ -56,39 +55,40 @@ class Poppler < Formula
   end
 
   def install
-    if ARGV.include? "--with-qt4"
-      ENV['POPPLER_QT4_CFLAGS'] = `pkg-config QtCore QtGui --libs`.chomp.strip
-      ENV.append 'LDFLAGS', "-Wl,-F#{HOMEBREW_PREFIX}/lib"
-    end
+    cmake_args = std_cmake_parameters.split
 
-    # Need to re-generate configure script to take advantage of a patch that
-    # adds native Mac font handling.
-    ENV['ACLOCAL'] = "/usr/bin/aclocal -I#{HOMEBREW_PREFIX}/share/aclocal -I/usr/share/aclocal"
-    ENV['AUTOMAKE'] = '/usr/bin/automake --foreign --add-missing --ignore-deps'
-    system 'touch config.rpath'
-    system '/usr/bin/autoreconf -fi'
-
-    args = ["--disable-dependency-tracking", "--prefix=#{prefix}"]
-    args << "--disable-poppler-qt4" unless ARGV.include? "--with-qt4"
-    args << "--enable-xpdf-headers" if ARGV.include? "--enable-xpdf-headers"
-
-    # TeXworks-specific additions to minimize library dependencies
-    args.concat [
-      '--disable-libpng',
-      '--disable-libjpeg',
-      '--disable-cms',
-      '--disable-abiword-output',
-      '--disable-cairo-output',
-      '--disable-poppler-glib',
-      '--disable-poppler-cpp',
-      '--disable-gdk',
-      '--disable-utils',
-      '--without-x',
-      '--enable-splash-output' # Required for proper font handling
+    # Save time by not building tests
+    cmake_args.concat [
+      '-DBUILD_CPP_TESTS=OFF',
+      '-DBUILD_GTK_TESTS=OFF',
+      '-DBUILD_QT3_TESTS=OFF',
+      '-DBUILD_QT4_TESTS=OFF'
     ]
 
-    system "./configure", *args
-    system "make install"
+    cmake_args << "-DWITH_Qt4=OFF" unless ARGV.include? "--with-qt4"
+    cmake_args << "-DENABLE_XPDF_HEADERS=ON" if ARGV.include? "--enable-xpdf-headers"
+
+    # TeXworks-specific additions to minimize library dependencies
+    cmake_args.concat [
+      '-DENABLE_ABIWORD=OFF',
+      '-DENABLE_CPP=OFF',
+      '-DENABLE_LCMS=OFF',
+      '-DENABLE_LIBCURL=OFF',
+      '-DENABLE_LIBOPENJPEG=OFF',
+      '-DENABLE_SPLASH=ON', # Required
+      '-DENABLE_UTILS=OFF',
+      '-DENABLE_ZLIB=OFF',
+      '-DWITH_Cairo=OFF',
+      '-DWITH_JPEG=OFF',
+      '-DWITH_PNG=OFF',
+      '-DWITH_Qt3=OFF'
+    ]
+
+    Dir.mkdir 'build'
+    Dir.chdir 'build' do
+      system 'cmake', '..', *cmake_args
+      system "make install"
+    end
 
     # Install poppler font data.
     PopplerData.new.brew do
