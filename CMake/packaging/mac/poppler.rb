@@ -41,6 +41,7 @@ class Poppler < Formula
     {
       :p1 => [
         TEXWORKS_PATCH_DIR + 'poppler-qt4-globalparams.patch',
+        TEXWORKS_PATCH_DIR + 'poppler-bogus-memory-allocation-fix.patch',
         TEXWORKS_PATCH_DIR + 'poppler-mac-font-handling.patch',
         TEXWORKS_PATCH_DIR + 'poppler-debug-mac-font-handling.patch'
       ]
