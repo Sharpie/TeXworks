@@ -540,6 +540,15 @@ void TWUtils::updateRecentFileActions(QObject *parent, QList<QAction*> &actions,
 	}
 }
 
+void TWUtils::clearRecentFileActions(QObject *parent, QList<QAction*> &actions, QMenu *menu) /* static */
+{
+  QSETTINGS_OBJECT(settings);
+
+  if (settings.contains("recentFiles")) { settings.remove("recentFiles"); }
+
+  updateRecentFileActions(parent, actions, menu);
+}
+
 void TWUtils::updateWindowMenu(QWidget *window, QMenu *menu) /* static */
 {
 	// shorten the menu by removing everything from the first "selectWindow" action onwards

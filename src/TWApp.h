@@ -171,6 +171,7 @@ private:
 public slots:
 	// called by documents when they load a file
 	void updateRecentFileActions();
+	void clearRecentFileActions();
 
 	// called by windows when they open/close/change name
 	void updateWindowMenus();

@@ -219,6 +219,9 @@ void TeXDocument::init()
 	connect(actionTypeset, SIGNAL(triggered()), this, SLOT(typeset()));
 
 	menuRecent = new QMenu(tr("Open Recent"), this);
+	QAction *clearRecent = menuRecent->addAction(tr("Clear Menu"));
+	QObject::connect(clearRecent, SIGNAL(triggered()), TWApp::instance(), SLOT(clearRecentFileActions()));
+	menuRecent->addSeparator();
 	updateRecentFileActions();
 	menuFile->insertMenu(actionOpen_Recent, menuRecent);
 	menuFile->removeAction(actionOpen_Recent);

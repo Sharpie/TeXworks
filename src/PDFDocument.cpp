@@ -1242,6 +1242,9 @@ PDFDocument::init()
 	connect(actionFind_Again, SIGNAL(triggered()), this, SLOT(doFindAgain()));
 
 	menuRecent = new QMenu(tr("Open Recent"), this);
+	QAction *clearRecent = menuRecent->addAction(tr("Clear Menu"));
+	QObject::connect(clearRecent, SIGNAL(triggered()), TWApp::instance(), SLOT(clearRecentFileActions()));
+	menuRecent->addSeparator();
 	updateRecentFileActions();
 	menuFile->insertMenu(actionOpen_Recent, menuRecent);
 	menuFile->removeAction(actionOpen_Recent);

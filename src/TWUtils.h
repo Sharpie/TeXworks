@@ -75,6 +75,7 @@ public:
 
 	// perform the updates to a menu; used by the documents to update their own menus
 	static void updateRecentFileActions(QObject *parent, QList<QAction*> &actions, QMenu *menu);
+	static void clearRecentFileActions(QObject *parent, QList<QAction*> &actions, QMenu *menu);
 
 	// update the SelWinActions in a menu, used by the documents
 	static void updateWindowMenu(QWidget *window, QMenu *menu);

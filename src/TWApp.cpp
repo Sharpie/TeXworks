@@ -220,6 +220,9 @@ void TWApp::init()
 	connect(actionOpen, SIGNAL(triggered()), this, SLOT(open()));
 
 	menuRecent = new QMenu(tr("Open Recent"));
+	QAction *clearRecent = menuRecent->addAction(tr("Clear Menu"));
+	QObject::connect(clearRecent, SIGNAL(triggered()), this, SLOT(clearRecentFileActions()));
+	menuRecent->addSeparator();
 	updateRecentFileActions();
 	menuFile->addMenu(menuRecent);
 
@@ -721,6 +724,12 @@ void TWApp::updateRecentFileActions()
 #ifdef Q_WS_MAC
 	TWUtils::updateRecentFileActions(this, recentFileActions, menuRecent);	
 #endif
+	emit recentFileActionsChanged();
+}
+
+void TWApp::clearRecentFileActions()
+{
+	TWUtils::clearRecentFileActions(this, recentFileActions, menuRecent);
 	emit recentFileActionsChanged();
 }
 
