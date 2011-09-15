@@ -226,7 +226,6 @@ private:
   Q_DISABLE_COPY(PDFPageGraphicsItem)
 
   QList<PDFLinkGraphicsItem *> loadLinks();
-  QImage renderPage(qreal scaleFactor);
 
 private slots:
   void addLinks();
