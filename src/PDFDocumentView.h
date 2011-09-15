@@ -210,3 +210,6 @@ public:
   static QEvent::Type LinkEvent;
   const int pageNum;
 };
+
+// vim: set sw=2 ts=2 et
+
