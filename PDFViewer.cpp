@@ -17,6 +17,10 @@ PDFViewer::PDFViewer(QString pdf_doc, QWidget *parent, Qt::WindowFlags flags) :
 
   toolBar->addAction(QIcon(":/icons/zoomin.png"), "Zoom In", docView, SLOT(zoomIn()));
   toolBar->addAction(QIcon(":/icons/zoomout.png"), "Zoom Out", docView, SLOT(zoomOut()));
+  toolBar->addSeparator();
+//  toolBar->addAction(tr("Single"), docView, SLOT(setSinglePageMode()));
+  toolBar->addAction(tr("1Col Cont"), docView, SLOT(setOneColContPageMode()));
+  toolBar->addAction(tr("2Col Cont"), docView, SLOT(setTwoColContPageMode()));
   counter->setLastPage(docView->lastPage());
   connect(docView, SIGNAL(changedPage(int)), counter, SLOT(setCurrentPage(int)));
   connect(docView, SIGNAL(changedZoom(qreal)), zoomWdgt, SLOT(setZoom(qreal)));
@@ -68,3 +72,6 @@ void ZoomTracker::refreshText() {
   setText(QString("Zoom %1%").arg(zoom * 100));
   update();
 }
+
+// vim: set sw=2 ts=2 et
+
