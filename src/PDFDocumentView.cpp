@@ -57,9 +57,29 @@ void PDFDocumentView::setScene(PDFDocumentScene *a_scene)
   // _May want to consider not doing this by default. It is conceivable to have
   // a View that would ignore page jumps that other scenes would respond to._
   connect(a_scene, SIGNAL(pageChangeRequested(int)), this, SLOT(goToPage(int)));
+  connect(a_scene, SIGNAL(pageLayoutChanged()), this, SLOT(pageLayoutChanged()));
 }
 int PDFDocumentView::currentPage() { return _currentPage; }
 int PDFDocumentView::lastPage()    { return _lastPage; }
+
+void PDFDocumentView::setPageMode(PageMode pageMode)
+{
+  if (!_pdf_scene || pageMode == _pageMode)
+    return;
+  
+  switch (pageMode) {
+//    case PageMode_SinglePage:
+//      break;
+    case PageMode_OneColumnContinuous:
+      _pdf_scene->pageLayout().setColumnCount(1, 0);
+      break;
+    case PageMode_TwoColumnContinuous:
+      _pdf_scene->pageLayout().setColumnCount(2, 1);
+      break;
+  }
+  _pageMode = pageMode;
+  _pdf_scene->pageLayout().relayout();
+}
 
 
 // Public Slots
@@ -76,7 +96,10 @@ void PDFDocumentView::goToPage(int pageNum)
   // We silently ignore any invalid page numbers.
   if ( (pageNum >= 0) && (pageNum < _lastPage) && (pageNum != _currentPage) )
   {
-    centerOn(_pdf_scene->pages().at(pageNum));
+    if (!_pdf_scene || _pdf_scene->pages().size() <= pageNum || !_pdf_scene->pages().at(pageNum))
+      return;
+    moveTopLeftTo(_pdf_scene->pages().at(pageNum)->pos());
+
     _currentPage = pageNum;
     emit changedPage(_currentPage);
   }
@@ -97,6 +120,9 @@ void PDFDocumentView::zoomOut()
   emit changedZoom(_zoomLevel);
 }
 
+// Protected Slots
+// --------------
+void PDFDocumentView::pageLayoutChanged() { goToPage(currentPage()); }
 
 // Event Handlers
 // --------------
@@ -123,12 +149,11 @@ void PDFDocumentView::paintEvent(QPaintEvent *event)
   pageBbox.setHeight(0.5 * pageBbox.height());
   int nextCurrentPage = _pdf_scene->pageNumAt(mapToScene(pageBbox));
 
-  if ( nextCurrentPage != _currentPage )
+  if ( nextCurrentPage != _currentPage && nextCurrentPage >= 0 && nextCurrentPage < _lastPage )
   {
     _currentPage = nextCurrentPage;
     emit changedPage(_currentPage);
   }
-
 }
 
 // **TODO:**
@@ -167,6 +192,16 @@ void PDFDocumentView::keyPressEvent(QKeyEvent *event)
   }
 }
 
+// Other
+// -----
+void PDFDocumentView::moveTopLeftTo(const QPointF scenePos) {
+  QRectF r(mapToScene(viewport()->rect()).boundingRect());
+  r.moveTopLeft(scenePos);
+  
+  // **TODO:** Investigate why this approach doesn't work during startup if
+  // the margin is set to 0
+  ensureVisible(r, 1, 1);
+}
 
 // PDFDocumentScene
 // ================
@@ -195,28 +230,22 @@ PDFDocumentScene::PDFDocumentScene(Poppler::Document *a_doc, QObject *parent):
   _doc->setRenderHint(Poppler::Document::TextAntialiasing);
 
   _lastPage = _doc->numPages();
+  
+  connect(&_pageLayout, SIGNAL(layoutChanged(const QRectF)), this, SLOT(pageLayoutChanged(const QRectF)));
 
-  // Create a `PDFPageGraphicsItem` for each page in the PDF document.  The
-  // Y-coordinate of each page is shifted such that it will appear 10px below
-  // the previous page.
-  //
-  // **TODO:** _Investigate things such as `QGraphicsGridLayout` that may take
-  // care of offset for us and make it easy to extend to 2-up or multipage
-  // views._
+  // Create a `PDFPageGraphicsItem` for each page in the PDF document and let
+  // them be layed out by a `PDFPageGridLayout` instance.
   int i;
-  float offY = 0.0;
   PDFPageGraphicsItem *pagePtr;
 
   for (i = 0; i < _lastPage; ++i)
   {
     pagePtr = new PDFPageGraphicsItem(_doc->page(i));
-    pagePtr->setPos(0.0, offY);
-
     _pages.append(pagePtr);
     addItem(pagePtr);
-
-    offY += pagePtr->pixmap().height() + 10.0;
+    _pageLayout.addPage(pagePtr);
   }
+  _pageLayout.relayout();
 }
 
 
@@ -238,10 +267,14 @@ QList<QGraphicsItem*> PDFDocumentScene::pages(const QPolygonF &polygon)
 };
 
 // This is a convenience function for returning the page number of the first
-// page item inside a given area of the scene.
+// page item inside a given area of the scene. If no page is in the specified
+// area, -1 is returned.
 int PDFDocumentScene::pageNumAt(const QPolygonF &polygon)
 {
-  return _pages.indexOf(pages(polygon).first());
+  QList<QGraphicsItem*> p(pages(polygon));
+  if (p.isEmpty())
+  	return -1;
+  return _pages.indexOf(p.first());
 }
 
 int PDFDocumentScene::lastPage() { return _lastPage; }
@@ -269,6 +302,15 @@ bool PDFDocumentScene::event(QEvent *event)
 
   return Super::event(event);
 }
+
+// Protected Slots
+// --------------
+void PDFDocumentScene::pageLayoutChanged(const QRectF& sceneRect)
+{
+  setSceneRect(sceneRect);
+  emit pageLayoutChanged();
+}
+
 
 // PDFPageGraphicsItem
 // ===================
@@ -665,4 +707,236 @@ void PDFPageRenderingThread::run()
     }
   }
 }
+
+PDFPageGridLayout::PDFPageGridLayout() :
+_numCols(1),
+_firstCol(0),
+_xSpacing(10),
+_ySpacing(10)
+{
+}
+
+void PDFPageGridLayout::setColumnCount(const int numCols) {
+  // We need at least one column
+  if (numCols <= 0)
+    return;
+  
+  _numCols = numCols;
+  // Make sure the first column is still valid
+  if (_firstCol >= _numCols)
+    _firstCol = _numCols - 1;
+  rearrange();
+}
+
+void PDFPageGridLayout::setColumnCount(const int numCols, const int firstCol) {
+  // We need at least one column
+  if (numCols <= 0)
+    return;
+  
+  _numCols = numCols;
+  
+  if (firstCol < 0)
+    _firstCol = 0;
+  else if (firstCol >= _numCols)
+    _firstCol = _numCols - 1;
+  else
+    _firstCol = firstCol;
+  rearrange();
+}
+
+void PDFPageGridLayout::setFirstColumn(const int firstCol) {
+  if (firstCol < 0)
+    _firstCol = 0;
+  else if (firstCol >= _numCols)
+    _firstCol = _numCols - 1;
+  else
+    _firstCol = firstCol;
+  rearrange();
+}
+
+void PDFPageGridLayout::setXSpacing(const qreal xSpacing) {
+  if (xSpacing > 0)
+    _xSpacing = xSpacing;
+  else
+    _xSpacing = 0.;
+}
+
+void PDFPageGridLayout::setYSpacing(const qreal ySpacing) {
+  if (ySpacing > 0)
+    _ySpacing = ySpacing;
+  else
+    _ySpacing = 0.;
+}
+
+int PDFPageGridLayout::rowCount() const {
+  if (_layoutItems.isEmpty())
+    return 0;
+  return _layoutItems.last().row + 1;
+}
+
+void PDFPageGridLayout::addPage(PDFPageGraphicsItem * page) {
+  LayoutItem item;
+  
+  if (!page)
+    return;
+  
+  item.page = page;
+  if (_layoutItems.isEmpty()) {
+    item.row = 0;
+    item.col = _firstCol;
+  }
+  else if (_layoutItems.last().col < _numCols - 1){
+    item.row = _layoutItems.last().row;
+    item.col = _layoutItems.last().col + 1;
+  }
+  else {
+    item.row = _layoutItems.last().row + 1;
+    item.col = 0;
+  }
+  _layoutItems.append(item);
+}
+
+void PDFPageGridLayout::removePage(PDFPageGraphicsItem * page) {
+  QList<LayoutItem>::iterator it;
+  int row, col;
+
+  // **TODO:** Decide what to do with pages that are in the list multiple times
+  // (see also insertPage())
+
+  // First, find the page and remove it
+  for (it = _layoutItems.begin(); it != _layoutItems.end(); ++it) {
+    if (it->page == page) {
+      row = it->row;
+      col = it->col;
+      it = _layoutItems.erase(it);
+      break;
+    }
+  }
+  
+  // Then, rearrange the pages behind it (no call to rearrange() to save time
+  // by not going over the unchanged pages in front of the removed one)
+  for (; it != _layoutItems.end(); ++it) {
+    it->row = row;
+    it->col = col;
+    
+    ++col;
+    if (col >= _numCols) {
+      col = 0;
+      ++row;
+    }
+  }
+}
+
+void PDFPageGridLayout::insertPage(PDFPageGraphicsItem * page, PDFPageGraphicsItem * before /* = NULL */) {
+  QList<LayoutItem>::iterator it;
+  int row, col;
+  LayoutItem item;
+  
+  item.page = page;
+
+  // **TODO:** Decide what to do with pages that are in the list multiple times
+  // (see also insertPage())
+
+  // First, find the page to insert before and insert (row and col will be set
+  // below)
+  for (it = _layoutItems.begin(); it != _layoutItems.end(); ++it) {
+    if (it->page == before) {
+      row = it->row;
+      col = it->col;
+      it = _layoutItems.insert(it, item);
+      break;
+    }
+  }
+  if (it == _layoutItems.end()) {
+    // We haven't found "before", so we just append the page
+    addPage(page);
+    return;
+  }
+  
+  // Then, rearrange the pages starting from the inserted one (no call to
+  // rearrange() to save time by not going over the unchanged pages)
+  for (; it != _layoutItems.end(); ++it) {
+    it->row = row;
+    it->col = col;
+    
+    ++col;
+    if (col >= _numCols) {
+      col = 0;
+      ++row;
+    }
+  }
+}
+
+// Relayout the pages on the canvas
+// **TODO:** Accessing Poppler::Page::pageSizeF() doesn't seem to pose a
+// threading problem; at least it can be done while rendering in the background
+// without acquiring the docMutex.
+// Maybe we should use a QReadWriteLock instead of docMutex?
+void PDFPageGridLayout::relayout() {
+  // Create arrays to hold offsets and make sure that they have
+  // sufficient space (to avoid moving the data around in memory)
+  QVector<qreal> colOffsets(_numCols + 1, 0), rowOffsets(rowCount() + 1, 0);
+  int i;
+  qreal x, y;
+  QList<LayoutItem>::iterator it;
+  PDFPageGraphicsItem * page;
+  QSizeF pageSize;
+  QRectF sceneRect;
+
+  // First, fill the offsets with the respective widths and heights
+  for (it = _layoutItems.begin(); it != _layoutItems.end(); ++it) {
+    if (!it->page || !it->page->_page)
+      continue;
+    page = it->page;
+    pageSize = page->_page->pageSizeF();
+    
+    if (colOffsets[it->col + 1] < pageSize.width() * page->_dpiX / 72.)
+      colOffsets[it->col + 1] = pageSize.width() * page->_dpiX / 72.;
+    if (rowOffsets[it->row + 1] < pageSize.height() * page->_dpiY / 72.)
+      rowOffsets[it->row + 1] = pageSize.height() * page->_dpiY / 72.;
+  }
+  
+  // Next, calculate cumulative offsets (including spacing)
+  for (i = 1; i <= _numCols; ++i)
+    colOffsets[i] += colOffsets[i - 1] + _xSpacing;
+  for (i = 1; i <= rowCount(); ++i)
+    rowOffsets[i] += rowOffsets[i - 1] + _ySpacing;
+  
+  // Finally, position pages
+  for (it = _layoutItems.begin(); it != _layoutItems.end(); ++it) {
+    if (!it->page || !it->page->_page)
+      continue;
+    // Center page in allotted space (in case we stumble over pages of different
+    // sizes, e.g., landscape pages, etc.)
+    pageSize = it->page->_page->pageSizeF();
+    x = 0.5 * (colOffsets[it->col + 1] + colOffsets[it->col] - _xSpacing - pageSize.width() * page->_dpiX / 72.);
+    y = 0.5 * (rowOffsets[it->row + 1] + rowOffsets[it->row] - _ySpacing - pageSize.height() * page->_dpiY / 72.);
+    it->page->setPos(x, y);
+  }
+  
+  // leave some space around the pages (note that the space on the right/bottom
+  // is already included in the corresponding Offset values)
+  sceneRect.setRect(-_xSpacing, -_ySpacing, colOffsets[_numCols] + _xSpacing, rowOffsets[rowCount()] + _ySpacing);
+  emit layoutChanged(sceneRect);
+}
+
+void PDFPageGridLayout::rearrange() {
+  QList<LayoutItem>::iterator it;
+  int row, col;
+  
+  row = 0;
+  col = _firstCol;
+  for (it = _layoutItems.begin(); it != _layoutItems.end(); ++it) {
+    it->row = row;
+    it->col = col;
+    
+    ++col;
+    if (col >= _numCols) {
+      col = 0;
+      ++row;
+    }
+  }
+}
+
+// vim: set sw=2 ts=2 et
 
