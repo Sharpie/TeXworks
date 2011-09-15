@@ -79,7 +79,7 @@ class PDFPageRenderingThread : public QThread
 public:
   PDFPageRenderingThread();
   virtual ~PDFPageRenderingThread();
-  
+
   void requestRender(PDFPageGraphicsItem * page, qreal scaleFactor);
 
 signals:
@@ -114,7 +114,7 @@ class PDFPageGridLayout : public QObject {
   int _firstCol;
   qreal _xSpacing; // spacing in pixel @ zoom=1
   qreal _ySpacing;
-  
+
 public:
   PDFPageGridLayout();
   virtual ~PDFPageGridLayout() { }
@@ -129,17 +129,17 @@ public:
   void setXSpacing(const qreal xSpacing);
   void setYSpacing(const qreal ySpacing);
   int rowCount() const;
-  
+
   void addPage(PDFPageGraphicsItem * page);
   void removePage(PDFPageGraphicsItem * page);
   void insertPage(PDFPageGraphicsItem * page, PDFPageGraphicsItem * before = NULL);
-  
+
 public slots:
   void relayout();
 
 signals:
   void layoutChanged();
-  
+
 private:
   void rearrange();
 };
@@ -204,7 +204,7 @@ class PDFPageGraphicsItem : public QObject, public QGraphicsPixmapItem
   QTransform _pageScale;
   qreal _zoomLevel;
   PDFPageRenderingThread * _connectedRenderingThread;
-  
+
   friend class PDFPageRenderingThread;
   friend class PDFPageGridLayout;
 
@@ -268,4 +268,3 @@ public:
 };
 
 // vim: set sw=2 ts=2 et
-
