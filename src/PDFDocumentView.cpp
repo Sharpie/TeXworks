@@ -1,5 +1,5 @@
 /**
- * Copyright 2011 Charlie Sharpsteen
+ * Copyright (C) 2011  Charlie Sharpsteen, Stefan Löffler
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -27,7 +27,9 @@ static bool isPageItem(QGraphicsItem *item) { return ( item->type() == PDFPageGr
 // and displaying the contents of a `Poppler::Document` using a `QGraphicsScene`.
 PDFDocumentView::PDFDocumentView(QWidget *parent):
   Super(parent),
-  _zoomLevel(1.0)
+  _zoomLevel(1.0),
+  _pageMode(PageMode_OneColumnContinuous),
+  _mouseMode(MouseMode_MagnifyingGlass)
 {
   setBackgroundRole(QPalette::Dark);
   setAlignment(Qt::AlignCenter);
@@ -37,6 +39,7 @@ PDFDocumentView::PDFDocumentView(QWidget *parent):
   // case, `goFirst()` or `goToPage(0)` will fail because the view will think
   // it is already looking at page 0.
   _currentPage = -1;
+  _magnifier = new PDFDocumentMagnifierView(this);
 }
 
 
@@ -57,6 +60,7 @@ void PDFDocumentView::setScene(PDFDocumentScene *a_scene)
   // _May want to consider not doing this by default. It is conceivable to have
   // a View that would ignore page jumps that other scenes would respond to._
   connect(a_scene, SIGNAL(pageChangeRequested(int)), this, SLOT(goToPage(int)));
+  connect(this, SIGNAL(changedPage(int)), this, SLOT(maybeUpdateSceneRect()));
 }
 int PDFDocumentView::currentPage() { return _currentPage; }
 int PDFDocumentView::lastPage()    { return _lastPage; }
@@ -66,23 +70,54 @@ void PDFDocumentView::setPageMode(PageMode pageMode)
   if (!_pdf_scene || pageMode == _pageMode)
     return;
 
+  // Save the current view relative to the current page so we can restore it
+  // after changing the mode
+  // **TODO:** Safeguard
+  QRectF viewRect(mapToScene(viewport()->rect()).boundingRect());
+  viewRect.translate(-_pdf_scene->pageAt(_currentPage)->pos());
+
+  // **TODO:** Avoid relayouting everything twice when switching from SinglePage
+  // to TwoColumnContinuous (once by setContinuous(), and a second time by
+  // setColumnCount() below)
   switch (pageMode) {
-//    case PageMode_SinglePage:
-//      break;
+    case PageMode_SinglePage:
+      _pdf_scene->showOnePage(_currentPage);
+      _pdf_scene->pageLayout().setContinuous(false);
+      break;
     case PageMode_OneColumnContinuous:
+      if (_pageMode == PageMode_SinglePage) {
+        _pdf_scene->pageLayout().setContinuous(true);
+        _pdf_scene->showAllPages();
+        // Reset the scene rect; causes it the encompass the whole scene
+        setSceneRect(QRectF());
+      }
       _pdf_scene->pageLayout().setColumnCount(1, 0);
       break;
     case PageMode_TwoColumnContinuous:
+      if (_pageMode == PageMode_SinglePage) {
+        _pdf_scene->pageLayout().setContinuous(true);
+        _pdf_scene->showAllPages();
+        // Reset the scene rect; causes it the encompass the whole scene
+        setSceneRect(QRectF());
+      }
       _pdf_scene->pageLayout().setColumnCount(2, 1);
       break;
   }
   _pageMode = pageMode;
   _pdf_scene->pageLayout().relayout();
+
+  // We might need to update the scene rect (when switching to single page mode)
+  maybeUpdateSceneRect();
+
+  // Restore the view from before as good as possible
+  viewRect.translate(_pdf_scene->pageAt(_currentPage)->pos());
+  ensureVisible(viewRect, 0, 0);
 }
 
 
 // Public Slots
 // ------------
+// **TODO:** goPrev() and goNext() should not (necessarily) center on top of page
 void PDFDocumentView::goPrev()  { goToPage(_currentPage - 1); }
 void PDFDocumentView::goNext()  { goToPage(_currentPage + 1); }
 void PDFDocumentView::goFirst() { goToPage(0); }
@@ -95,8 +130,13 @@ void PDFDocumentView::goToPage(int pageNum)
   // We silently ignore any invalid page numbers.
   if ( (pageNum >= 0) && (pageNum < _lastPage) && (pageNum != _currentPage) )
   {
-    centerOn(_pdf_scene->pages().at(pageNum));
+    if (!_pdf_scene || _pdf_scene->pages().size() <= pageNum || !_pdf_scene->pageAt(pageNum))
+      return;
+    moveTopLeftTo(_pdf_scene->pageAt(pageNum)->pos());
+
     _currentPage = pageNum;
+    if (_pageMode == PageMode_SinglePage && _pdf_scene)
+      _pdf_scene->showOnePage(_currentPage);
     emit changedPage(_currentPage);
   }
 }
@@ -105,17 +145,54 @@ void PDFDocumentView::goToPage(int pageNum)
 void PDFDocumentView::zoomIn()
 {
   _zoomLevel *= 3.0/2.0;
+  // Set the transformation anchor to AnchorViewCenter so we always zoom into
+  // the center of the view (rather than into the upper left corner)
+  QGraphicsView::ViewportAnchor anchor = transformationAnchor();
+  setTransformationAnchor(QGraphicsView::AnchorViewCenter);
   this->scale(3.0/2.0, 3.0/2.0);
+  setTransformationAnchor(anchor);
   emit changedZoom(_zoomLevel);
 }
 
 void PDFDocumentView::zoomOut()
 {
   _zoomLevel *= 2.0/3.0;
+  // Set the transformation anchor to AnchorViewCenter so we always zoom out of
+  // the center of the view (rather than out of the upper left corner)
+  QGraphicsView::ViewportAnchor anchor = transformationAnchor();
+  setTransformationAnchor(QGraphicsView::AnchorViewCenter);
   this->scale(2.0/3.0, 2.0/3.0);
+  setTransformationAnchor(anchor);
   emit changedZoom(_zoomLevel);
 }
 
+void PDFDocumentView::setMouseMode(const MouseMode newMode)
+{
+  if (_mouseMode == newMode)
+    return;
+
+  if (_mouseMode == MouseMode_Move)
+    setDragMode(QGraphicsView::ScrollHandDrag);
+
+  switch (newMode) {
+    case MouseMode_Move:
+      setDragMode(QGraphicsView::ScrollHandDrag);
+      break;
+  }
+  _mouseMode = newMode;
+}
+
+// Protected Slots
+// --------------
+void PDFDocumentView::maybeUpdateSceneRect() {
+  if (!_pdf_scene || _pageMode != PageMode_SinglePage)
+    return;
+
+  // Set the scene rect of the view, i.e., the rect accessible via the scroll
+  // bars. In single page mode, this must be the rect of the current page
+  // **TODO:** Safeguard
+  setSceneRect(_pdf_scene->pageAt(_currentPage)->sceneBoundingRect());
+}
 
 // Event Handlers
 // --------------
@@ -147,13 +224,14 @@ void PDFDocumentView::paintEvent(QPaintEvent *event)
     _currentPage = nextCurrentPage;
     emit changedPage(_currentPage);
   }
-
 }
 
 // **TODO:**
 //
 //   * _Should we let some parent widget worry about delegating Page
 //     Up/PageDown/other keypresses?_
+// **TODO:** Handle mouseWheel/Key_Up/Key_Down events at the edge of pages in
+// single page mode
 void PDFDocumentView::keyPressEvent(QKeyEvent *event)
 {
   switch ( event->key() )
@@ -186,6 +264,124 @@ void PDFDocumentView::keyPressEvent(QKeyEvent *event)
   }
 }
 
+void PDFDocumentView::mousePressEvent(QMouseEvent * event)
+{
+  switch (_mouseMode) {
+    case MouseMode_MagnifyingGlass:
+      if (_magnifier) {
+        _magnifier->prepareToShow();
+        _magnifier->setPosition(event->pos());
+        _magnifier->show();
+      }
+      break;
+    default:
+      // Nothing to do
+      break;
+  }
+  Super::mousePressEvent(event);
+}
+
+void PDFDocumentView::mouseMoveEvent(QMouseEvent * event)
+{
+  switch (_mouseMode) {
+    case MouseMode_MagnifyingGlass:
+      if (_magnifier)
+        _magnifier->setPosition(event->pos());
+      break;
+    default:
+      // Nothing to do
+      break;
+  }
+  Super::mouseMoveEvent(event);
+}
+
+void PDFDocumentView::mouseReleaseEvent(QMouseEvent * event)
+{
+  switch (_mouseMode) {
+    case MouseMode_MagnifyingGlass:
+      if (_magnifier)
+        _magnifier->hide();
+      break;
+    default:
+      // Nothing to do
+      break;
+  }
+  Super::mouseReleaseEvent(event);
+}
+
+
+// Other
+// -----
+void PDFDocumentView::moveTopLeftTo(const QPointF scenePos) {
+  QRectF r(mapToScene(viewport()->rect()).boundingRect());
+  r.moveTopLeft(scenePos);
+  
+  // **TODO:** Investigate why this approach doesn't work during startup if
+  // the margin is set to 0
+  ensureVisible(r, 1, 1);
+}
+
+
+// PDFDocumentMagnifierView
+// ========================
+//
+PDFDocumentMagnifierView::PDFDocumentMagnifierView(PDFDocumentView *parent /* = 0 */) :
+  Super(parent),
+  _parent_view(parent),
+  _zoomFactor(2.0),
+  _zoomLevel(1.0)
+{
+  // the magnifier should initially be hidden
+  hide();
+
+  // suppress scrollbars
+  setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  // suppress any border styling
+  setFrameShape(QFrame::NoFrame);
+
+  if (parent) {
+    // transfer some settings from the parent view
+    setBackgroundRole(parent->backgroundRole());
+    setAlignment(parent->alignment());
+  }
+
+  // **TODO:** magnifier size and shape should be configurable
+  setFixedSize(200 * 4 / 3, 200);
+}
+
+void PDFDocumentMagnifierView::prepareToShow()
+{
+  qreal zoomLevel;
+
+  if (!_parent_view)
+    return;
+
+  // Ensure we have the same scene
+  if (_parent_view->scene() != scene())
+    setScene(_parent_view->scene());
+  // Fix the zoom
+  zoomLevel = _parent_view->zoomLevel() * _zoomFactor;
+  if (zoomLevel != _zoomLevel)
+    scale(zoomLevel / _zoomLevel, zoomLevel / _zoomLevel);
+  _zoomLevel = zoomLevel;
+  // Ensure we have enough padding at the border that we can display the
+  // magnifier even beyond the edge
+  setSceneRect(_parent_view->sceneRect().adjusted(-width() / _zoomLevel, -height() / _zoomLevel, width() / _zoomLevel, height() / _zoomLevel));
+}
+
+void PDFDocumentMagnifierView::setZoomFactor(const qreal zoomFactor)
+{
+  _zoomFactor = zoomFactor;
+  // Actual handling of zoom levels happens in prepareToShow, as the zoom level
+  // of the parent cannot change while the magnifier is shown
+}
+
+void PDFDocumentMagnifierView::setPosition(const QPoint pos)
+{
+  move(pos.x() - width() / 2, pos.y() - height() / 2);
+  centerOn(_parent_view->mapToScene(pos));
+}
 
 // PDFDocumentScene
 // ================
@@ -207,6 +403,10 @@ PDFDocumentScene::PDFDocumentScene(Poppler::Document *a_doc, QObject *parent):
   _doc(a_doc),
   docMutex(new QMutex)
 {
+  // We need to register a QList<PDFLinkGraphicsItem *> meta-type so we can
+  // pass it through inter-thread (i.e., queued) connections
+  qRegisterMetaType< QList<PDFLinkGraphicsItem *> >();
+
   // **TODO:** _Investigate the Arthur backend for native Qt rendering._
   _doc->setRenderBackend(Poppler::Document::SplashBackend);
   // Make things look pretty.
@@ -214,14 +414,11 @@ PDFDocumentScene::PDFDocumentScene(Poppler::Document *a_doc, QObject *parent):
   _doc->setRenderHint(Poppler::Document::TextAntialiasing);
 
   _lastPage = _doc->numPages();
+  
+  connect(&_pageLayout, SIGNAL(layoutChanged(const QRectF)), this, SLOT(pageLayoutChanged(const QRectF)));
 
-  // Create a `PDFPageGraphicsItem` for each page in the PDF document.  The
-  // Y-coordinate of each page is shifted such that it will appear 10px below
-  // the previous page.
-  //
-  // **TODO:** _Investigate things such as `QGraphicsGridLayout` that may take
-  // care of offset for us and make it easy to extend to 2-up or multipage
-  // views._
+  // Create a `PDFPageGraphicsItem` for each page in the PDF document and let
+  // them be layed out by a `PDFPageLayout` instance.
   int i;
   PDFPageGraphicsItem *pagePtr;
 
@@ -252,6 +449,15 @@ QList<QGraphicsItem*> PDFDocumentScene::pages(const QPolygonF &polygon)
 
   return pageList;
 };
+
+// Convenience function to avoid moving the complete list of pages around
+// between functions if only one page is needed
+QGraphicsItem* PDFDocumentScene::pageAt(const int idx)
+{
+  if (idx < 0 || idx >= _pages.size())
+    return NULL;
+  return _pages[idx];
+}
 
 // This is a convenience function for returning the page number of the first
 // page item inside a given area of the scene. If no page is in the specified
@@ -290,6 +496,39 @@ bool PDFDocumentScene::event(QEvent *event)
   return Super::event(event);
 }
 
+// Protected Slots
+// --------------
+void PDFDocumentScene::pageLayoutChanged(const QRectF& sceneRect)
+{
+  setSceneRect(sceneRect);
+  emit pageLayoutChanged();
+}
+
+// Other
+// -----
+void PDFDocumentScene::showOnePage(const int pageIdx) const
+{
+  int i;
+
+  for (i = 0; i < _pages.size(); ++i) {
+    if (!isPageItem(_pages[i]))
+      continue;
+    _pages[i]->setVisible(i == pageIdx);
+  }
+}
+
+void PDFDocumentScene::showAllPages() const
+{
+  int i;
+
+  for (i = 0; i < _pages.size(); ++i) {
+    if (!isPageItem(_pages[i]))
+      continue;
+    _pages[i]->setVisible(true);
+  }
+}
+
+
 // PDFPageGraphicsItem
 // ===================
 
@@ -316,25 +555,23 @@ PDFPageGraphicsItem::PDFPageGraphicsItem(Poppler::Page *a_page, QGraphicsItem *p
   _linksLoaded(false),
   _pageIsRendering(false),
   _zoomLevel(0.0),
-  _connectedRenderingThread(NULL)
+  _magnifiedZoomLevel(0.0)
 {
-  // The `_linkGenerator` is used to monitor asynchronous generation of
-  // `PDFLinkGraphicsItem` objects associated with the links on this page.
-  _linkGenerator = new QFutureWatcher< QList<PDFLinkGraphicsItem *> >(this);
-  connect(_linkGenerator, SIGNAL(finished()), this, SLOT(addLinks()));
-
   // Create an empty pixmap that is the same size as the PDF page. This
   // allows us to delay the rendering of pages until they actually come into
   // view yet still know what the page size is.
-  QSizeF pageSize = _page->pageSizeF() / 72.0;
-  pageSize.setHeight(pageSize.height() * _dpiY);
-  pageSize.setWidth(pageSize.width() * _dpiX);
+  _pageSize = _page->pageSizeF();
+  _pageSize.setWidth(_pageSize.width() * _dpiX / 72.0);
+  _pageSize.setHeight(_pageSize.height() * _dpiY / 72.0);
 
-  _pageScale = QTransform::fromScale(pageSize.width(), pageSize.height());
-  setPixmap(QPixmap(pageSize.toSize()));
-  _renderedPage = QPixmap(pageSize.toSize());
+  _pageScale = QTransform::fromScale(_pageSize.width(), _pageSize.height());
+  // If we have a thumbnail image, use that as temporary image
+  if (_page && !_page->thumbnail().isNull())
+    _temporaryPage = QPixmap::fromImage(_page->thumbnail()).scaled(_pageSize.toSize());
+  _renderedPage = QPixmap(_pageSize.toSize());
 }
 
+QRectF PDFPageGraphicsItem::boundingRect() const { return QRectF(QPointF(0.0, 0.0), _pageSize); }
 int PDFPageGraphicsItem::type() const { return Type; }
 
 // An overloaded paint method allows us to render the contents of
@@ -345,15 +582,22 @@ void PDFPageGraphicsItem::paint(QPainter *painter, const QStyleOptionGraphicsIte
   // Really, there is an X scaling factor and a Y scaling factor, but we assume
   // that the X scaling factor is equal to the Y scaling factor.
   qreal scaleFactor = painter->transform().m11();
+  PDFDocumentScene * docScene = qobject_cast<PDFDocumentScene*>(scene());
 
   // If this is the first time this `PDFPageGraphicsItem` has come into view,
   // `_linksLoaded` will be `false`. We then load all of the links on the page.
   if ( not _linksLoaded )
   {
-    // If this page has links, we generate `PDFLinkGraphicsItems` in a separate
-    // thread. The `_linkGenerator` will emit a `finished` signal when
-    // generation is complete.
-    _linkGenerator->setFuture(QtConcurrent::run(this, &PDFPageGraphicsItem::loadLinks));
+    if (docScene) {
+      // Connect the rendering thread's signal to this object to receive
+      // notifications of finished pages
+      // **TODO:** If we ever reassign pages to other scenes, revisit this!
+      // Right now, we don't disconnect from the old scene (to ensure we receive
+      // late pageReady messages and those don't vanish into nirvana)
+      PageProcessingLoadLinksRequest * request = docScene->processingThread().requestLoadLinks(this);
+      if (request)
+        connect(request, SIGNAL(linksReady(QList<PDFLinkGraphicsItem *>)), this, SLOT(addLinks(QList<PDFLinkGraphicsItem *>)));
+    }
 
     _linksLoaded = true;
 
@@ -362,103 +606,118 @@ void PDFPageGraphicsItem::paint(QPainter *painter, const QStyleOptionGraphicsIte
     _renderedPage.fill();
   }
 
-  // We look at the zoom level and render a new page if the zoom has changed or
-  // still has the value of `0.0` set by the constructor.
-  if ( (_zoomLevel != scaleFactor) && not _pageIsRendering )
-  {
-    // Indicate that a render is in progress so that subsequent paint events
-    // won't trigger a re-render. Once `_pageImageGenerator` emits a `finished`
-    // signal, this boolean is cleared.
-    _pageIsRendering = true;
-
-    PDFDocumentScene * docScene = qobject_cast<PDFDocumentScene*>(scene());
-    if (docScene) {
-      // Connect the rendering thread's signal to this object to receive
-      // notifications of finished pages
-      // **TODO:** If we ever reassign pages to other scenes, revisit this!
-      // Right now, we don't disconnect from the old scene (to ensure we receive
-      // late pageReady messages and those don't vanish into nirvana)
-      if (_connectedRenderingThread != &(docScene->renderingThread())) {
-        connect(&(docScene->renderingThread()), SIGNAL(pageReady(PDFPageGraphicsItem *, qreal, QImage)), this, SLOT(maybeUpdateRenderedPage(PDFPageGraphicsItem *, qreal, QImage)));
-      }
-      docScene->renderingThread().requestRender(this, scaleFactor);
-    }
-
-    _zoomLevel = scaleFactor;
-  }
-
   // The transformation matrix of the `painter` object contains information
   // such as the current zoom level of the widget viewing this PDF page. We use
   // this matrix to position the page and then reset the transformation matrix
   // to an identity matrix as the page image has already been resized during
   // rendering.
-  QPointF origin = painter->transform().map(offset());
+  QPointF origin = painter->transform().map(QPointF(0.0, 0.0));
 
-  // This part is modified from the `paint` method of `QGraphicsPixmapItem`.
-  painter->setRenderHint(QPainter::SmoothPixmapTransform,
-    (transformationMode() == Qt::SmoothTransformation));
+  // **TODO:** This way of detecting whether this is a magnifier request
+  // seems a bit hokey; we should probably use some sort of type() method
+  // **TODO:** Find a better way than to repeat the same code twice (once for
+  // the magnifier, and once for the normal display)
+  if (widget && widget->parent() && widget->parent()->inherits("PDFDocumentMagnifierView")) {
+    if ( (_magnifiedZoomLevel != scaleFactor) && not _pageIsRendering )
+    {
+      // Indicate that a render is in progress so that subsequent paint events
+      // won't trigger a re-render. Once `_pageImageGenerator` emits a `finished`
+      // signal, this boolean is cleared.
+      _pageIsRendering = true;
 
-  if ( _pageIsRendering ) {
-    // A new resized page is still rendering, so we "blow up" our current
-    // render and paint that.
-    //
-    // **TODO:** _The performance of this degrades heavily at high zoom levels.
-    // Mostly due to the use of `scaled` on the pixmap. Find a more efficient
-    // way to scale._
-    QSizeF scaledSize = painter->transform().mapRect(boundingRect()).size();
-    painter->setTransform(QTransform());
-    painter->drawPixmap(origin, _renderedPage.scaled(scaledSize.toSize()));
-  } else {
-    painter->setTransform(QTransform());
-    painter->drawPixmap(origin, _renderedPage);
+      if (docScene) {
+        // Connect the rendering thread's signal to this object to receive
+        // notifications of finished pages
+        // **TODO:** If we ever reassign pages to other scenes, revisit this!
+        // Right now, we don't disconnect from the old scene (to ensure we receive
+        // late pageReady messages and those don't vanish into nirvana)
+        PageProcessingRenderPageRequest * request = docScene->processingThread().requestRenderPage(this, scaleFactor);
+        if (request) {
+          connect(request, SIGNAL(pageImageReady(qreal, QImage)), this, SLOT(updateMagnifiedPage(qreal, QImage)));
+        }
+      }
+
+      _magnifiedZoomLevel = scaleFactor;
+    }
+    if ( _pageIsRendering ) {
+      // A new resized page is still rendering, so we "blow up" our current
+      // render and paint that. For performance reasons, we store this so we don't
+      // need to recreate it in every paint event.
+      // Note: Creating the scaled pixmap can take some time at high
+      // magnifications, as can copying the fully rendered page from the rendering
+      // thread into _renderedPage. Both cause a small lag on the UI.
+      // **TODO:** Investigate if it would help to only move pointers around. In
+      // this case, we'd have to take care which thread an image belongs to before
+      // assigning/deallocating.
+      QSizeF scaledSize = painter->transform().mapRect(boundingRect()).size();
+
+      if (_temporaryMagnifiedPage.isNull() || _temporaryMagnifiedPage.size() != scaledSize.toSize())
+        _temporaryMagnifiedPage = _renderedPage.scaled(scaledSize.toSize());
+
+      painter->setTransform(QTransform());
+      painter->drawPixmap(origin, _temporaryMagnifiedPage);
+    } else {
+      painter->setTransform(QTransform());
+      painter->drawPixmap(origin, _magnifiedPage);
+    }
+  }
+  else {
+    // We look at the zoom level and render a new page if the zoom has changed or
+    // still has the value of `0.0` set by the constructor.
+    if ( (_zoomLevel != scaleFactor) && not _pageIsRendering )
+    {
+      // Indicate that a render is in progress so that subsequent paint events
+      // won't trigger a re-render. Once `_pageImageGenerator` emits a `finished`
+      // signal, this boolean is cleared.
+      _pageIsRendering = true;
+
+      if (docScene) {
+        // Connect the rendering thread's signal to this object to receive
+        // notifications of finished pages
+        // **TODO:** If we ever reassign pages to other scenes, revisit this!
+        // Right now, we don't disconnect from the old scene (to ensure we receive
+        // late pageReady messages and those don't vanish into nirvana)
+        PageProcessingRenderPageRequest * request = docScene->processingThread().requestRenderPage(this, scaleFactor);
+        if (request) {
+          connect(request, SIGNAL(pageImageReady(qreal, QImage)), this, SLOT(updateRenderedPage(qreal, QImage)));
+        }
+      }
+
+      _zoomLevel = scaleFactor;
+    }
+    if ( _pageIsRendering ) {
+      // A new resized page is still rendering, so we "blow up" our current
+      // render and paint that. For performance reasons, we store this so we don't
+      // need to recreate it in every paint event.
+      // Note: Creating the scaled pixmap can take some time at high
+      // magnifications, as can copying the fully rendered page from the rendering
+      // thread into _renderedPage. Both cause a small lag on the UI.
+      // **TODO:** Investigate if it would help to only move pointers around. In
+      // this case, we'd have to take care which thread an image belongs to before
+      // assigning/deallocating.
+      QSizeF scaledSize = painter->transform().mapRect(boundingRect()).size();
+
+      if (_temporaryPage.isNull() || _temporaryPage.size() != scaledSize.toSize())
+        _temporaryPage = _renderedPage.scaled(scaledSize.toSize());
+
+      painter->setTransform(QTransform());
+      painter->drawPixmap(origin, _temporaryPage);
+    } else {
+      painter->setTransform(QTransform());
+      painter->drawPixmap(origin, _renderedPage);
+    }
   }
 }
 
-
-// Asynchronous Link Generation
-// ----------------------------
-
-// This function generates `PDFLinkGraphicsItem` objects. It is intended to be
-// called asynchronously and so does not set parentage for the objects it
-// generates --- this task is left to the `addLinks` method so that all the
-// links are added and rendered in a synchronous operation.
-QList<PDFLinkGraphicsItem *> PDFPageGraphicsItem::loadLinks()
-{
-  // **TODO:**
-  //
-  //   * _Comment on how `pageScale` works and is used._
-
-  // We need to acquire a mutex from `PDFDocumentScene` as accessing page data,
-  // such as reading link lists or rendering page images is not thread safe
-  // among pages objects created from the same document object.
-  QMutexLocker docLock(qobject_cast<PDFDocumentScene *>(scene())->docMutex);
-    QList<Poppler::Link *> links = _page->links();
-  docLock.unlock();
-
-  QList<PDFLinkGraphicsItem *> linkList;
-  if( links.empty() ) return linkList;
-
-  PDFLinkGraphicsItem *linkItem;
-
-  foreach( Poppler::Link *link, links )
-  {
-    linkItem = new PDFLinkGraphicsItem(link);
-    linkItem->setTransform(_pageScale);
-
-    linkList.append(linkItem);
-  }
-
-  return linkList;
-}
 
 // This method causes the `PDFPageGraphicsItem` to take ownership of
 // asynchronously generated `PDFLinkGraphicsItem` objects. Calling
 // `setParentItem` causes the link objects to be added to the scene that owns
 // the page object. `update` is then called to ensure all links are drawn at
 // once.
-void PDFPageGraphicsItem::addLinks()
+void PDFPageGraphicsItem::addLinks(QList<PDFLinkGraphicsItem *> links)
 {
-  foreach( PDFLinkGraphicsItem *item, _linkGenerator->result() ) item->setParentItem(this);
+  foreach( PDFLinkGraphicsItem *item, links ) item->setParentItem(this);
 
   update();
 }
@@ -467,11 +726,8 @@ void PDFPageGraphicsItem::addLinks()
 // Asynchronous Page Rendering
 // ---------------------------
 
-void PDFPageGraphicsItem::maybeUpdateRenderedPage(PDFPageGraphicsItem * page, qreal scaleFactor, QImage pageImage)
+void PDFPageGraphicsItem::updateRenderedPage(qreal scaleFactor, QImage pageImage)
 {
-  if (page != this)
-    return;
-
   // We store the rendered page in a new member named `renderedPage` rather
   // than the `pixmap` member inherited from `QGraphicsPixmapItem`. This is
   // because the size of `pixmap` is used to calculate a bunch of geometric
@@ -479,6 +735,32 @@ void PDFPageGraphicsItem::maybeUpdateRenderedPage(PDFPageGraphicsItem * page, qr
   // just want to increase the resolution, not affect the geometry of the item
   // in the graphics scene.
   _renderedPage = QPixmap::fromImage(pageImage);
+
+  // Since we have the fully rendered page now, we don't need any temporarily
+  // scaled version anymore
+  if (!_temporaryPage.isNull())
+    _temporaryPage = QPixmap();
+
+  // Indicate that page rendering has completed and this item needs to be
+  // re-drawn.
+  _pageIsRendering = false;
+  update();
+}
+
+void PDFPageGraphicsItem::updateMagnifiedPage(qreal scaleFactor, QImage pageImage)
+{
+  // We store the rendered page in a new member named `renderedPage` rather
+  // than the `pixmap` member inherited from `QGraphicsPixmapItem`. This is
+  // because the size of `pixmap` is used to calculate a bunch of geometric
+  // attributes for `QGraphicsPixmapItem`. When the page is re-rendered, we
+  // just want to increase the resolution, not affect the geometry of the item
+  // in the graphics scene.
+  _magnifiedPage = QPixmap::fromImage(pageImage);
+
+  // Since we have the fully rendered page now, we don't need any temporarily
+  // scaled version anymore
+  if (!_temporaryMagnifiedPage.isNull())
+    _temporaryMagnifiedPage = QPixmap();
 
   // Indicate that page rendering has completed and this item needs to be
   // re-drawn.
@@ -615,12 +897,12 @@ PDFLinkEvent::PDFLinkEvent(int a_page) : Super(LinkEvent), pageNum(a_page) {}
 // filter out these events.
 QEvent::Type PDFLinkEvent::LinkEvent = static_cast<QEvent::Type>( QEvent::registerEventType() );
 
-PDFPageRenderingThread::PDFPageRenderingThread() :
+PDFPageProcessingThread::PDFPageProcessingThread() :
 _quit(false)
 {
 }
 
-PDFPageRenderingThread::~PDFPageRenderingThread()
+PDFPageProcessingThread::~PDFPageProcessingThread()
 {
   _mutex.lock();
   _quit = true;
@@ -629,37 +911,71 @@ PDFPageRenderingThread::~PDFPageRenderingThread()
   wait();
 }
 
-void PDFPageRenderingThread::requestRender(PDFPageGraphicsItem * page, qreal scaleFactor)
+PageProcessingRenderPageRequest * PDFPageProcessingThread::requestRenderPage(PDFPageGraphicsItem * page, qreal scaleFactor)
 {
   int i;
-  StackItem workItem;
+  PageProcessingRenderPageRequest * workItem = new PageProcessingRenderPageRequest(page, scaleFactor);
 
-  workItem.page = page;
-  workItem.scaleFactor = scaleFactor;
-
-  QMutexLocker(&(this->_mutex));
+  QMutexLocker locker(&(this->_mutex));
   // remove any instances of the given graphics item before adding it to avoid
   // rendering it several times
   // **TODO:** Could it be that we require several concurrent versions of the
   //           same page?
   for (i = _workStack.size() - 1; i >= 0; --i) {
-    if (_workStack[i].page == page)
+    if (_workStack[i]->page == page && _workStack[i]->type() == PageProcessingRequest::PageRendering) {
+      // Using deleteLater() doesn't work because we have no event queue in this
+      // thread. However, since the object is still on the stack, it is still
+      // sleeping and directly deleting it should therefore be safe.
+      delete _workStack[i];
       _workStack.remove(i);
+    }
   }
 
   _workStack.push(workItem);
+  locker.unlock();
 
-  qDebug() << "new request added to stack; now has" << _workStack.size() << "items";
+  qDebug() << "new render request added to stack; now has" << _workStack.size() << "items";
 
   if (!isRunning())
     start();
   else
     _waitCondition.wakeOne();
+  return workItem;
 }
 
-void PDFPageRenderingThread::run()
+PageProcessingLoadLinksRequest* PDFPageProcessingThread::requestLoadLinks(PDFPageGraphicsItem * page)
 {
-  StackItem workItem;
+  int i;
+  PageProcessingLoadLinksRequest * workItem = new PageProcessingLoadLinksRequest(page);
+
+  QMutexLocker locker(&(this->_mutex));
+  // remove any instances of the given graphics item before adding it to avoid
+  // rendering it several times
+  for (i = _workStack.size() - 1; i >= 0; --i) {
+    if (_workStack[i]->page == page && _workStack[i]->type() == PageProcessingRequest::LoadLinks) {
+      // Using deleteLater() doesn't work because we have no event queue in this
+      // thread. However, since the object is still on the stack, it is still
+      // sleeping and directly deleting it should therefore be safe.
+      delete _workStack[i];
+      _workStack.remove(i);
+    }
+  }
+
+  _workStack.push(workItem);
+  locker.unlock();
+
+  qDebug() << "new 'load links' request added to stack; now has" << _workStack.size() << "items";
+
+  if (!isRunning())
+    start();
+  else
+    _waitCondition.wakeOne();
+  return workItem;
+}
+
+void PDFPageProcessingThread::run()
+{
+  PageProcessingRequest * workItem;
 
   _mutex.lock();
   while (!_quit) {
@@ -668,14 +984,17 @@ void PDFPageRenderingThread::run()
       workItem = _workStack.pop();
       _mutex.unlock();
 
-      qDebug() << "starting to render; remaining items:" << _workStack.size();
+      qDebug() << "processing work item; remaining items:" << _workStack.size();
+      workItem->execute();
 
-      if (workItem.page && workItem.page->_page && qobject_cast<PDFDocumentScene *>(workItem.page->scene())) {
-        QMutexLocker docLock(qobject_cast<PDFDocumentScene *>(workItem.page->scene())->docMutex);
-        QImage pageImage = workItem.page->_page->renderToImage(workItem.page->_dpiX * workItem.scaleFactor, workItem.page->_dpiY * workItem.scaleFactor);
-        docLock.unlock();
-        emit pageReady(workItem.page, workItem.scaleFactor, pageImage);
-      }
+      // Delete the work item as it has fulfilled its purpose
+      // Note that we can't delete it here or we might risk that some emitted
+      // signals are invalidated; to ensure they reach their destination, we
+      // need to call deleteLater(), which requires and event queue; thus, we
+      // first move it to the main processing thread
+      workItem->moveToThread(QApplication::instance()->thread());
+      workItem->deleteLater();
+
       _mutex.lock();
     }
     else {
@@ -686,17 +1005,18 @@ void PDFPageRenderingThread::run()
   }
 }
 
-PDFPageGridLayout::PDFPageGridLayout() :
+PDFPageLayout::PDFPageLayout() :
 _numCols(1),
 _firstCol(0),
 _xSpacing(10),
-_ySpacing(10)
+_ySpacing(10),
+_isContinuous(true)
 {
 }
 
-void PDFPageGridLayout::setColumnCount(const int numCols) {
-  // We need at least one column
-  if (numCols <= 0)
+void PDFPageLayout::setColumnCount(const int numCols) {
+  // We need at least one column, and we only handle changes
+  if (numCols <= 0 || numCols == _numCols)
     return;
 
   _numCols = numCols;
@@ -706,9 +1026,9 @@ void PDFPageGridLayout::setColumnCount(const int numCols) {
   rearrange();
 }
 
-void PDFPageGridLayout::setColumnCount(const int numCols, const int firstCol) {
-  // We need at least one column
-  if (numCols <= 0)
+void PDFPageLayout::setColumnCount(const int numCols, const int firstCol) {
+  // We need at least one column, and we only handle changes
+  if (numCols <= 0 || (numCols == _numCols && firstCol == _firstCol))
     return;
 
   _numCols = numCols;
@@ -722,7 +1042,11 @@ void PDFPageGridLayout::setColumnCount(const int numCols, const int firstCol) {
   rearrange();
 }
 
-void PDFPageGridLayout::setFirstColumn(const int firstCol) {
+void PDFPageLayout::setFirstColumn(const int firstCol) {
+  // We only handle changes
+  if (firstCol == _firstCol)
+    return;
+
   if (firstCol < 0)
     _firstCol = 0;
   else if (firstCol >= _numCols)
@@ -732,27 +1056,38 @@ void PDFPageGridLayout::setFirstColumn(const int firstCol) {
   rearrange();
 }
 
-void PDFPageGridLayout::setXSpacing(const qreal xSpacing) {
+void PDFPageLayout::setXSpacing(const qreal xSpacing) {
   if (xSpacing > 0)
     _xSpacing = xSpacing;
   else
     _xSpacing = 0.;
 }
 
-void PDFPageGridLayout::setYSpacing(const qreal ySpacing) {
+void PDFPageLayout::setYSpacing(const qreal ySpacing) {
   if (ySpacing > 0)
     _ySpacing = ySpacing;
   else
     _ySpacing = 0.;
 }
 
-int PDFPageGridLayout::rowCount() const {
+void PDFPageLayout::setContinuous(const bool continuous /* = true */)
+{
+  if (continuous == _isContinuous)
+    return;
+  _isContinuous = continuous;
+  if (!_isContinuous)
+    setColumnCount(1, 0);
+    // setColumnCount() calls relayout automatically
+  else relayout();
+}
+
+int PDFPageLayout::rowCount() const {
   if (_layoutItems.isEmpty())
     return 0;
   return _layoutItems.last().row + 1;
 }
 
-void PDFPageGridLayout::addPage(PDFPageGraphicsItem * page) {
+void PDFPageLayout::addPage(PDFPageGraphicsItem * page) {
   LayoutItem item;
 
   if (!page)
@@ -774,7 +1109,7 @@ void PDFPageGridLayout::addPage(PDFPageGraphicsItem * page) {
   _layoutItems.append(item);
 }
 
-void PDFPageGridLayout::removePage(PDFPageGraphicsItem * page) {
+void PDFPageLayout::removePage(PDFPageGraphicsItem * page) {
   QList<LayoutItem>::iterator it;
   int row, col;
 
@@ -805,7 +1140,7 @@ void PDFPageGridLayout::removePage(PDFPageGraphicsItem * page) {
   }
 }
 
-void PDFPageGridLayout::insertPage(PDFPageGraphicsItem * page, PDFPageGraphicsItem * before /* = NULL */) {
+void PDFPageLayout::insertPage(PDFPageGraphicsItem * page, PDFPageGraphicsItem * before /* = NULL */) {
   QList<LayoutItem>::iterator it;
   int row, col;
   LayoutItem item;
@@ -845,7 +1180,24 @@ void PDFPageGridLayout::insertPage(PDFPageGraphicsItem * page, PDFPageGraphicsIt
   }
 }
 
-void PDFPageGridLayout::relayout() {
+// Relayout the pages on the canvas
+// **TODO:** Accessing Poppler::Page::pageSizeF() doesn't seem to pose a
+// threading problem; at least it can be done while rendering in the background
+// without acquiring the docMutex.
+// Maybe we should use a QReadWriteLock instead of docMutex?
+void PDFPageLayout::relayout() {
+  if (_isContinuous)
+    continuousModeRelayout();
+  else
+    singlePageModeRelayout();
+}
+
+// Relayout the pages on the canvas in continuous mode
+// **TODO:** Accessing Poppler::Page::pageSizeF() doesn't seem to pose a
+// threading problem; at least it can be done while rendering in the background
+// without acquiring the docMutex.
+// Maybe we should use a QReadWriteLock instead of docMutex?
+void PDFPageLayout::continuousModeRelayout() {
   // Create arrays to hold offsets and make sure that they have
   // sufficient space (to avoid moving the data around in memory)
   QVector<qreal> colOffsets(_numCols + 1, 0), rowOffsets(rowCount() + 1, 0);
@@ -854,6 +1206,7 @@ void PDFPageGridLayout::relayout() {
   QList<LayoutItem>::iterator it;
   PDFPageGraphicsItem * page;
   QSizeF pageSize;
+  QRectF sceneRect;
 
   // First, fill the offsets with the respective widths and heights
   for (it = _layoutItems.begin(); it != _layoutItems.end(); ++it) {
@@ -875,21 +1228,68 @@ void PDFPageGridLayout::relayout() {
     rowOffsets[i] += rowOffsets[i - 1] + _ySpacing;
 
   // Finally, position pages
+  // **TODO:** Figure out why this loop causes some noticable lag when switching
+  // from SinglePage to continuous mode in a large document (but not when
+  // switching between separate continuous modes)
   for (it = _layoutItems.begin(); it != _layoutItems.end(); ++it) {
     if (!it->page || !it->page->_page)
       continue;
-    // Center page in allotted space (in case we stumble over pages of different
-    // sizes, e.g., landscape pages, etc.)
+    // If we have more than one column, right-align the left-most column and
+    // left-align the right-most column to avoid large space between columns
+    // In all other cases, center the page in allotted space (in case we
+    // stumble over pages of different sizes, e.g., landscape pages, etc.)
     pageSize = it->page->_page->pageSizeF();
-    x = 0.5 * (colOffsets[it->col + 1] + colOffsets[it->col] - _xSpacing - pageSize.width());
-    y = 0.5 * (rowOffsets[it->row + 1] + rowOffsets[it->row] - _ySpacing - pageSize.height());
+    if (_numCols > 1 && it->col == 0)
+      x = colOffsets[it->col + 1] - _xSpacing - pageSize.width() * page->_dpiX / 72.;
+    else if (_numCols > 1 && it->col == _numCols - 1)
+      x = colOffsets[it->col];
+    else
+      x = 0.5 * (colOffsets[it->col + 1] + colOffsets[it->col] - _xSpacing - pageSize.width() * page->_dpiX / 72.);
+    // Always center the page vertically
+    y = 0.5 * (rowOffsets[it->row + 1] + rowOffsets[it->row] - _ySpacing - pageSize.height() * page->_dpiY / 72.);
     it->page->setPos(x, y);
   }
 
-  emit layoutChanged();
+  // leave some space around the pages (note that the space on the right/bottom
+  // is already included in the corresponding Offset values)
+  sceneRect.setRect(-_xSpacing, -_ySpacing, colOffsets[_numCols] + _xSpacing, rowOffsets[rowCount()] + _ySpacing);
+  emit layoutChanged(sceneRect);
 }
 
-void PDFPageGridLayout::rearrange() {
+// Relayout the pages on the canvas in single page mode
+// **TODO:** Accessing Poppler::Page::pageSizeF() doesn't seem to pose a
+// threading problem; at least it can be done while rendering in the background
+// without acquiring the docMutex.
+// Maybe we should use a QReadWriteLock instead of docMutex?
+void PDFPageLayout::singlePageModeRelayout()
+{
+  qreal width, height, maxWidth = 0.0, maxHeight = 0.0;
+  QList<LayoutItem>::iterator it;
+  PDFPageGraphicsItem * page;
+  QSizeF pageSize;
+  QRectF sceneRect;
+
+  // We lay out all pages such that their center is in the origin (since only
+  // one page is visible at any time, this is no problem)
+  for (it = _layoutItems.begin(); it != _layoutItems.end(); ++it) {
+    if (!it->page || !it->page->_page)
+      continue;
+    page = it->page;
+    pageSize = page->_page->pageSizeF();
+    width = pageSize.width() * page->_dpiX / 72.;
+    height = pageSize.height() * page->_dpiY / 72.;
+    if (width > maxWidth)
+      maxWidth = width;
+    if (height > maxHeight)
+      maxHeight = height;
+    page->setPos(-width / 2., -height / 2.);
+  }
+
+  sceneRect.setRect(-maxWidth / 2., -maxHeight / 2., maxWidth, maxHeight);
+  emit layoutChanged(sceneRect);
+}
+
+void PDFPageLayout::rearrange() {
   QList<LayoutItem>::iterator it;
   int row, col;
 
@@ -906,6 +1306,66 @@ void PDFPageGridLayout::rearrange() {
     }
   }
 }
+
+PageProcessingRenderPageRequest::PageProcessingRenderPageRequest(PDFPageGraphicsItem * page, qreal scaleFactor) :
+  PageProcessingRequest(page),
+  scaleFactor(scaleFactor)
+{
+}
+
+bool PageProcessingRenderPageRequest::execute()
+{
+  if (!page || !qobject_cast<PDFDocumentScene *>(page->scene()) || !page->_page)
+    return false;
+
+  QMutexLocker docLock(qobject_cast<PDFDocumentScene *>(page->scene())->docMutex);
+  QImage pageImage = page->_page->renderToImage(page->_dpiX * scaleFactor, page->_dpiY * scaleFactor);
+  docLock.unlock();
+  
+  emit pageImageReady(scaleFactor, pageImage);
+  return true;
+}
+
+// Asynchronous Link Generation
+// ----------------------------
+
+// This function generates `PDFLinkGraphicsItem` objects. It is intended to be
+// called asynchronously and so does not set parentage for the objects it
+// generates --- this task is left to the `addLinks` method so that all the
+// links are added and rendered in a synchronous operation.
+bool PageProcessingLoadLinksRequest::execute()
+{
+  if (!page || !qobject_cast<PDFDocumentScene *>(page->scene()) || !page->_page)
+    return false;
+
+  // **TODO:**
+  //
+  //   * _Comment on how `pageScale` works and is used._
+
+  // We need to acquire a mutex from `PDFDocumentScene` as accessing page data,
+  // such as reading link lists or rendering page images is not thread safe
+  // among pages objects created from the same document object.
+  QMutexLocker docLock(qobject_cast<PDFDocumentScene *>(page->scene())->docMutex);
+    QList<Poppler::Link *> links = page->_page->links();
+  docLock.unlock();
+
+  QList<PDFLinkGraphicsItem *> linkList;
+  if( !links.isEmpty() ) {
+    PDFLinkGraphicsItem *linkItem;
+
+    foreach( Poppler::Link *link, links )
+    {
+      linkItem = new PDFLinkGraphicsItem(link);
+      linkItem->setTransform(page->_pageScale);
+
+      linkList.append(linkItem);
+    }
+  }
+
+  emit linksReady(linkList);
+  return true;
+}
+
 
 // vim: set sw=2 ts=2 et
 
