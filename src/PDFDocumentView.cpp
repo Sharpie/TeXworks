@@ -267,9 +267,18 @@ void PDFDocumentView::keyPressEvent(QKeyEvent *event)
 
 void PDFDocumentView::mousePressEvent(QMouseEvent * event)
 {
+  Super::mousePressEvent(event);
+
+  // Don't do anything if the event was handled elsewhere (e.g., by a
+  // PDFLinkGraphicsItem)
+  if (event->isAccepted())
+    return;
+
   switch (_mouseMode) {
     case MouseMode_MagnifyingGlass:
-      if (_magnifier) {
+      // We only handle left mouse button events; no composites (like left+right
+      // mouse buttons)
+      if (_magnifier && event->buttons() == Qt::LeftButton) {
         _magnifier->prepareToShow();
         _magnifier->setPosition(event->pos());
         _magnifier->show();
@@ -279,35 +288,47 @@ void PDFDocumentView::mousePressEvent(QMouseEvent * event)
       // Nothing to do
       break;
   }
-  Super::mousePressEvent(event);
 }
 
 void PDFDocumentView::mouseMoveEvent(QMouseEvent * event)
 {
+  Super::mouseMoveEvent(event);
+
+  // We don't check for event->isAccepted() here; for one, this always seems to
+  // return true (for whatever reason), but more importantly, without enabling
+  // mouse tracking we only receive this event if the current widget has grabbed
+  // the mouse (i.e., after a mousePressEvent and before the corresponding
+  // mouseReleaseEvent)
+
   switch (_mouseMode) {
     case MouseMode_MagnifyingGlass:
-      if (_magnifier)
+      if (_magnifier && _magnifier->isVisible())
         _magnifier->setPosition(event->pos());
       break;
     default:
       // Nothing to do
       break;
   }
-  Super::mouseMoveEvent(event);
 }
 
 void PDFDocumentView::mouseReleaseEvent(QMouseEvent * event)
 {
+  Super::mouseReleaseEvent(event);
+
+  // We don't check for event->isAccepted() here; for one, this always seems to
+  // return true (for whatever reason), but more importantly, without enabling
+  // mouse tracking we only receive this event if the current widget has grabbed
+  // the mouse (i.e., after a mousePressEvent)
+
   switch (_mouseMode) {
     case MouseMode_MagnifyingGlass:
-      if (_magnifier)
+      if (_magnifier && _magnifier->isVisible())
         _magnifier->hide();
       break;
     default:
       // Nothing to do
       break;
   }
-  Super::mouseReleaseEvent(event);
 }
 
 
@@ -467,8 +488,13 @@ int PDFDocumentScene::pageNumAt(const QPolygonF &polygon)
 {
   QList<QGraphicsItem*> p(pages(polygon));
   if (p.isEmpty())
-	return -1;
+    return -1;
   return _pages.indexOf(p.first());
+}
+
+int PDFDocumentScene::pageNumFor(PDFPageGraphicsItem * const graphicsItem) const
+{
+  return _pages.indexOf(graphicsItem);
 }
 
 int PDFDocumentScene::lastPage() { return _lastPage; }
@@ -810,6 +836,46 @@ PDFLinkGraphicsItem::PDFLinkGraphicsItem(Poppler::Link *a_link, QGraphicsItem *p
   // efficient...
   setPen(QPen(Qt::transparent));
 #endif
+
+  // Set some meaningful tooltip to inform the user what the link does
+  // Using <p>...</p> ensures the tooltip text is interpreted as rich text
+  // and thus is wrapping sensibly to avoid over-long lines.
+  // Using PDFDocumentView::trUtf8 avoids having to explicitly derive
+  // PDFLinkGraphicsItem explicily from QObject and puts all translatable
+  // strings into the same context.
+  switch(_link->linkType()) {
+    case Poppler::Link::Goto:
+      Poppler::LinkGoto * linkGoto;
+      linkGoto = reinterpret_cast<Poppler::LinkGoto*>(_link);
+      if (!linkGoto->isExternal())
+        setToolTip(PDFDocumentView::trUtf8("<p>Goto page %1</p>").arg(linkGoto->destination().pageNumber()));
+      else
+        //: Example: "Goto page 5 of abc.pdf"
+        setToolTip(PDFDocumentView::trUtf8("<p>Goto page %1 of %2</p>").arg(linkGoto->destination().pageNumber()).arg(linkGoto->fileName()));
+      break;
+    case Poppler::Link::Execute:
+      Poppler::LinkExecute * linkExecute;
+      linkExecute = reinterpret_cast<Poppler::LinkExecute*>(_link);
+      if (linkExecute->parameters().isEmpty())
+        setToolTip(PDFDocumentView::trUtf8("<p>Execute `%1`</p>"));
+      else
+        //: Example: "Execute `ls -1`"
+        setToolTip(PDFDocumentView::trUtf8("<p>Execute `%1 %2`</p>"));
+      break;
+    case Poppler::Link::Browse:
+      Poppler::LinkBrowse * linkBrowse;
+      linkBrowse = reinterpret_cast<Poppler::LinkBrowse*>(_link);
+      setToolTip(QString::fromUtf8("<p>%1</p>").arg(linkBrowse->url()));
+      break;
+      // Unsupported link types
+//    case Poppler::Link::Action:
+//    case Poppler::Link::Sound:
+//    case Poppler::Link::Movie:
+//    case Poppler::Link::JavaScript:
+//    case Poppler::Link::None:
+    default:
+      break;
+  }
 }
 
 int PDFLinkGraphicsItem::type() const { return Type; }
@@ -941,7 +1007,7 @@ PageProcessingRenderPageRequest * PDFPageProcessingThread::requestRenderPage(PDF
   _workStack.push(workItem);
   locker.unlock();
 #ifdef DEBUG
-  qDebug() << "new render request added to stack; now has" << _workStack.size() << "items";
+  qDebug() << "new render request for page" << qobject_cast<PDFDocumentScene*>(page->scene())->pageNumFor(page) << "added to stack; now has" << _workStack.size() << "items";
 #endif
 
   if (!isRunning())
@@ -972,7 +1038,7 @@ PageProcessingLoadLinksRequest* PDFPageProcessingThread::requestLoadLinks(PDFPag
   _workStack.push(workItem);
   locker.unlock();
 #ifdef DEBUG
-  qDebug() << "new 'load links' request added to stack; now has" << _workStack.size() << "items";
+  qDebug() << "new 'load links' request for page" << qobject_cast<PDFDocumentScene*>(page->scene())->pageNumFor(page) << "added to stack; now has" << _workStack.size() << "items";
 #endif
 
   if (!isRunning())
@@ -1002,13 +1068,13 @@ void PDFPageProcessingThread::run()
       QString jobDesc;
       switch (workItem->type()) {
         case PageProcessingRequest::LoadLinks:
-          jobDesc = "loading links";
+          jobDesc = QString::fromUtf8("loading links");
           break;
         case PageProcessingRequest::PageRendering:
-          jobDesc = "rendering page";
+          jobDesc = QString::fromUtf8("rendering page");
           break;
       }
-      qDebug() << "finished " << jobDesc << "; time elapsed:" << _renderTimer.elapsed() << " ms";
+      qDebug() << "finished " << jobDesc << "for page" << qobject_cast<PDFDocumentScene*>(workItem->page->scene())->pageNumFor(workItem->page) << "; time elapsed:" << _renderTimer.elapsed() << "ms";
 #endif
 
       // Delete the work item as it has fulfilled its purpose
