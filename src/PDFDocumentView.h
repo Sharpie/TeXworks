@@ -35,6 +35,7 @@ class PDFDocumentView : public QGraphicsView {
 public:
   enum PageMode { PageMode_SinglePage, PageMode_OneColumnContinuous, PageMode_TwoColumnContinuous };
   enum MouseMode { MouseMode_MagnifyingGlass, MouseMode_Move };
+  enum MagnifierShape { Magnifier_Rectangle, Magnifier_Circle };
 
   PDFDocumentView(QWidget *parent = 0);
   void setScene(PDFDocumentScene *a_scene);
@@ -54,6 +55,8 @@ public slots:
   void setOneColContPageMode() { setPageMode(PageMode_OneColumnContinuous); }
   void setTwoColContPageMode() { setPageMode(PageMode_TwoColumnContinuous); }
   void setMouseMode(const MouseMode newMode);
+  void setMagnifierShape(const MagnifierShape shape);
+  void setMagnifierSize(const int size);
 
   void zoomIn();
   void zoomOut();
@@ -88,17 +91,25 @@ class PDFDocumentMagnifierView : public QGraphicsView {
   PDFDocumentView * _parent_view;
   qreal _zoomLevel, _zoomFactor;
 
+  PDFDocumentView::MagnifierShape _shape;
+  int _size;
+
 public:
   PDFDocumentMagnifierView(PDFDocumentView *parent = 0);
   // the zoom factor multiplies the parent view's _zoomLevel
   void setZoomFactor(const qreal zoomFactor);
   void setPosition(const QPoint pos);
+  void setShape(const PDFDocumentView::MagnifierShape shape);
+  void setSize(const int size);
   // ensures all settings are in sync with the parent view
   // make sure you call it before calling show()!
   // Note: we cannot override show() because prepareToShow() usually needs to be
   // called before setPosition as well (as it adjusts the region accessible in
   // setPosition())
   void prepareToShow();
+
+protected:
+  void wheelEvent(QWheelEvent * event) { event->ignore(); }
 };
 
 class PageProcessingRequest : public QObject
@@ -172,8 +183,15 @@ public:
   PDFPageProcessingThread();
   virtual ~PDFPageProcessingThread();
 
-  PageProcessingRenderPageRequest* requestRenderPage(PDFPageGraphicsItem * page, qreal scaleFactor);
-  PageProcessingLoadLinksRequest* requestLoadLinks(PDFPageGraphicsItem * page);
+  PageProcessingRenderPageRequest* requestRenderPage(PDFPageGraphicsItem * page, const qreal scaleFactor) const;
+  PageProcessingLoadLinksRequest* requestLoadLinks(PDFPageGraphicsItem * page) const;
+
+  // add a processing request to the work stack
+  // Note: request must have been created on the heap and must be in the scope
+  // of this thread; use requestRenderPage() and requestLoadLinks() for that
+  // Note: this must be separate from the request...() methods to allow the
+  // calling thread some late initialization (e.g., connecting to signals)
+  void addPageProcessingRequest(PageProcessingRequest * request);
 
 protected:
   virtual void run();
