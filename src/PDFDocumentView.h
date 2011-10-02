@@ -63,6 +63,7 @@ public slots:
   void setMagnifierShape(const MagnifierShape shape);
   void setMagnifierSize(const int size);
 
+  void zoomBy(qreal zoomFactor);
   void zoomIn();
   void zoomOut();
 
