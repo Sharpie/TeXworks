@@ -62,6 +62,7 @@ void PDFDocumentView::setScene(PDFDocumentScene *a_scene)
   // a View that would ignore page jumps that other scenes would respond to._
   connect(a_scene, SIGNAL(pageChangeRequested(int)), this, SLOT(goToPage(int)));
   connect(this, SIGNAL(changedPage(int)), this, SLOT(maybeUpdateSceneRect()));
+  connect(_pdf_scene, SIGNAL(pdfLinkActivated(const Poppler::Link*)), this, SLOT(pdfLinkActivated(const Poppler::Link*)));
 }
 int PDFDocumentView::currentPage() { return _currentPage; }
 int PDFDocumentView::lastPage()    { return _lastPage; }
@@ -249,6 +250,47 @@ void PDFDocumentView::maybeUpdateSceneRect() {
   setSceneRect(_pdf_scene->pageAt(_currentPage)->sceneBoundingRect());
 }
 
+void PDFDocumentView::pdfLinkActivated(const Poppler::Link * link)
+{
+  if (!link)
+    return;
+
+  // Propagate link signals so that the outside world doesn't have to care about
+  // our internal implementation (document/view structure, poppler, etc.)
+  switch (link->linkType())
+  {
+    case Poppler::Link::Goto:
+    {
+      const Poppler::LinkGoto *linkGoto = reinterpret_cast<const Poppler::LinkGoto*>(link);
+      Q_ASSERT( linkGoto != NULL );
+      emit requestOpenPdf(linkGoto->fileName(), linkGoto->destination().pageNumber());
+      return;
+    }
+    case Poppler::Link::Browse:
+    {
+      const Poppler::LinkBrowse *linkBrowse = reinterpret_cast<const Poppler::LinkBrowse*>(link);
+      Q_ASSERT( linkBrowse != NULL );
+      emit requestOpenUrl(QUrl::fromEncoded(linkBrowse->url().toAscii()));
+      return;
+    }
+    case Poppler::Link::Execute:
+    {
+      const Poppler::LinkExecute *linkExecute = reinterpret_cast<const Poppler::LinkExecute*>(link);
+      Q_ASSERT( linkExecute != NULL );
+      emit requestExecuteCommand(linkExecute->fileName(), linkExecute->parameters());
+      return;
+    }
+    // **TODO:**
+    // We don't handle Link::Action yet, but the ActionTypes Quit, Presentation,
+    // EndPresentation, Find, GoToPage, Close, and Print should be propagated to
+    // the outside world
+    case Poppler::Link::Action:
+    default:
+      return;
+  }
+}
+
+
 // Event Handlers
 // --------------
 
@@ -278,6 +320,15 @@ void PDFDocumentView::paintEvent(QPaintEvent *event)
   {
     _currentPage = nextCurrentPage;
     emit changedPage(_currentPage);
+  }
+
+  // Draw a drop shadow
+  if (_magnifier && _magnifier->isVisible()) {
+    QPainter p(viewport());
+    QPixmap dropShadow(_magnifier->dropShadow());
+    QRect r(QPoint(0, 0), dropShadow.size());
+    r.moveCenter(_magnifier->geometry().center());
+    p.drawPixmap(r.topLeft(), dropShadow);
   }
 }
 
@@ -343,6 +394,7 @@ void PDFDocumentView::mousePressEvent(QMouseEvent * event)
         _magnifier->prepareToShow();
         _magnifier->setPosition(event->pos());
         _magnifier->show();
+        viewport()->update();
       }
       break;
     default:
@@ -363,8 +415,10 @@ void PDFDocumentView::mouseMoveEvent(QMouseEvent * event)
 
   switch (_mouseMode) {
     case MouseMode_MagnifyingGlass:
-      if (_magnifier && _magnifier->isVisible())
+      if (_magnifier && _magnifier->isVisible()) {
         _magnifier->setPosition(event->pos());
+        viewport()->update();
+      }
       break;
     default:
       // Nothing to do
@@ -383,8 +437,10 @@ void PDFDocumentView::mouseReleaseEvent(QMouseEvent * event)
 
   switch (_mouseMode) {
     case MouseMode_MagnifyingGlass:
-      if (_magnifier && _magnifier->isVisible())
+      if (_magnifier && _magnifier->isVisible()) {
         _magnifier->hide();
+        viewport()->update();
+      }
       break;
     default:
       // Nothing to do
@@ -422,7 +478,8 @@ PDFDocumentMagnifierView::PDFDocumentMagnifierView(PDFDocumentView *parent /* = 
   // suppress scrollbars
   setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-  // suppress any border styling
+  // suppress any border styling (which doesn't work with a mask, e.g., for a
+  // circular magnifier)
   setFrameShape(QFrame::NoFrame);
 
   if (parent) {
@@ -497,6 +554,133 @@ void PDFDocumentMagnifierView::setSize(const int size)
   }
 }
 
+void PDFDocumentMagnifierView::paintEvent(QPaintEvent * event)
+{
+  Super::paintEvent(event);
+
+  // Draw our custom border
+  // Note that QGraphicsView is derived from QAbstractScrollArea, but we are not
+  // asked to paint on that but on the widget it contains. Therefore, we can't
+  // just say QPainter(this)
+  QPainter painter(viewport());
+
+  painter.setRenderHint(QPainter::Antialiasing);
+  
+  QPen pen(Qt::gray);
+  pen.setWidth(2);
+  
+  QRect rect(this->rect());
+
+  painter.setPen(pen);
+  switch(_shape) {
+    case PDFDocumentView::Magnifier_Rectangle:
+      painter.drawRect(rect);
+      break;
+    case PDFDocumentView::Magnifier_Circle:
+      // Ensure we're drawing where we should, regardless how the window system
+      // handles masks
+      painter.setClipRegion(mask());
+      // **TODO:** It seems to be necessary to adjust the window rect by one pixel
+      // to draw an evenly wide border; is there a better way?
+      rect.adjust(1, 1, 0, 0);
+      painter.drawEllipse(rect);
+      break;
+  }
+
+  // **Note:** We don't/can't draw the drop-shadow here. The reason is that we
+  // rely on Super::paintEvent to do the actual rendering, which constructs its
+  // own QPainter so we can't do clipping. Resetting the mask is no option,
+  // either, as that may trigger an update (recursion!).
+  // Alternatively, we could fill the border with the background from the
+  // underlying window. But _parent_view->render() no option, because it
+  // requires QWidget::DrawChildren (apparently the QGraphicsItems are
+  // implemented as child widgets) which would cause a recursion again (the
+  // magnifier is also a child widget!). Calling scene()->render() is no option,
+  // either, because then render requests for unmagnified images would originate
+  // from here, which would break the current implementation of
+  // PDFPageGraphicsItem::paint().
+  // Instead, drop-shadows are drawn in PDFDocumentView::paintEvent(), invoking
+  // PDFDocumentMagnifierView::dropShadow().
+}
+
+// Modelled after http://labs.qt.nokia.com/2009/10/07/magnifying-glass
+QPixmap PDFDocumentMagnifierView::dropShadow() const
+{
+  int padding = 10;
+  QPixmap retVal(width() + 2 * padding, height() + 2 * padding);
+
+  retVal.fill(Qt::transparent);
+
+  switch(_shape) {
+    case PDFDocumentView::Magnifier_Rectangle:
+      {
+        QPainterPath path;
+        QRectF boundingRect(retVal.rect().adjusted(0, 0, -1, -1));
+        QLinearGradient gradient(boundingRect.center(), QPointF(0.0, boundingRect.center().y()));
+        gradient.setSpread(QGradient::ReflectSpread);
+        QGradientStops stops;
+        QColor color(Qt::black);
+        color.setAlpha(64);
+        stops.append(QGradientStop(1.0 - padding * 2.0 / retVal.width(), color));
+        color.setAlpha(0);
+        stops.append(QGradientStop(1.0, color));
+
+        QPainter shadow(&retVal);
+        shadow.setRenderHint(QPainter::Antialiasing);
+
+        // paint horizontal gradient
+        gradient.setStops(stops);
+
+        path = QPainterPath();
+        path.moveTo(boundingRect.topLeft());
+        path.lineTo(boundingRect.topLeft() + QPointF(padding, padding));
+        path.lineTo(boundingRect.bottomRight() + QPointF(-padding, -padding));
+        path.lineTo(boundingRect.bottomRight());
+        path.lineTo(boundingRect.topRight());
+        path.lineTo(boundingRect.topRight() + QPointF(-padding, padding));
+        path.lineTo(boundingRect.bottomLeft() + QPointF(padding, -padding));
+        path.lineTo(boundingRect.bottomLeft());
+        path.closeSubpath();
+
+        shadow.fillPath(path, gradient);
+
+        // paint vertical gradient
+        stops[0].first = 1.0 - padding * 2.0 / retVal.height();
+        gradient.setStops(stops);
+
+        path = QPainterPath();
+        path.moveTo(boundingRect.topLeft());
+        path.lineTo(boundingRect.topLeft() + QPointF(padding, padding));
+        path.lineTo(boundingRect.bottomRight() + QPointF(-padding, -padding));
+        path.lineTo(boundingRect.bottomRight());
+        path.lineTo(boundingRect.bottomLeft());
+        path.lineTo(boundingRect.bottomLeft() + QPointF(padding, -padding));
+        path.lineTo(boundingRect.topRight() + QPointF(-padding, padding));
+        path.lineTo(boundingRect.topRight());
+        path.closeSubpath();
+
+        gradient.setFinalStop(QPointF(QRectF(retVal.rect()).center().x(), 0.0));
+        shadow.fillPath(path, gradient);
+      }
+      break;
+    case PDFDocumentView::Magnifier_Circle:
+      {
+        QRadialGradient gradient(QRectF(retVal.rect()).center(), retVal.width() / 2.0, QRectF(retVal.rect()).center());
+        QColor color(Qt::black);
+        color.setAlpha(0);
+        gradient.setColorAt(1.0, color);
+        color.setAlpha(64);
+        gradient.setColorAt(1.0 - padding * 2.0 / retVal.width(), color);
+        
+        QPainter shadow(&retVal);
+        shadow.setRenderHint(QPainter::Antialiasing);
+        shadow.fillRect(retVal.rect(), gradient);
+      }
+      break;
+  }
+  return retVal;
+}
+
 
 // PDFDocumentScene
 // ================
@@ -545,6 +729,52 @@ PDFDocumentScene::PDFDocumentScene(Poppler::Document *a_doc, QObject *parent):
     _pageLayout.addPage(pagePtr);
   }
   _pageLayout.relayout();
+}
+
+void PDFDocumentScene::handleLinkEvent(const PDFLinkEvent * link_event)
+{
+  if (!link_event)
+    return;
+
+  switch ( link_event->link->linkType() )
+  {
+    case Poppler::Link::Goto:
+    {
+      const Poppler::LinkGoto *linkGoto = reinterpret_cast<const Poppler::LinkGoto*>(link_event->link);
+      Q_ASSERT( linkGoto != NULL );
+
+      // We don't handle external links here - this is the responsibility of
+      // some other component of the app
+      if ( linkGoto->isExternal() ) break;
+
+      // Jump by page number. Links reckon page numbers starting with 1 so we
+      // subtract to conform with 0-based indexing used by C++.
+      //
+      // **NOTE:**
+      // _There are many details that are not being considered, such as
+      // centering on a specific anchor point and possibly changing the zoom
+      // level rather than just focusing on the center of the target page._
+      emit pageChangeRequested(linkGoto->destination().pageNumber() - 1);
+      return;
+    }
+    // Unsupported link types that we silently ignore (as they are of no
+    // relevance outside the viewer)
+    case Poppler::Link::None:
+    case Poppler::Link::JavaScript:
+    case Poppler::Link::Sound:
+    case Poppler::Link::Movie:
+      return;
+    // Link types that we don't handle here but that may be of interest
+    // elsewhere
+    case Poppler::Link::Browse:
+    case Poppler::Link::Execute:
+    case Poppler::Link::Action:
+    default:
+      break;
+  }
+  // Translate into a signal that can be handled by some other part of the
+  // program, such as a `PDFDocumentView`.
+  emit pdfLinkActivated(link_event->link);
 }
 
 
@@ -606,10 +836,7 @@ bool PDFDocumentScene::event(QEvent *event)
     // Cast to a pointer for `PDFLinkEvent` so that we can access the `pageNum`
     // field.
     const PDFLinkEvent *link_event = dynamic_cast<const PDFLinkEvent*>(event);
-
-    // Translate into a signal that can be handled by some other part of the
-    // program, such as a `PDFDocumentView`.
-    emit pageChangeRequested(link_event->pageNum);
+    handleLinkEvent(link_event);
     return true;
   }
 
@@ -1010,67 +1237,11 @@ void PDFLinkGraphicsItem::mouseReleaseEvent(QGraphicsSceneMouseEvent *event)
     return;
   }
 
-  switch ( _link->linkType() )
-  {
-
-    case Poppler::Link::Goto:
-    {
-      const Poppler::LinkGoto *linkGoto = reinterpret_cast<Poppler::LinkGoto*>(_link);
-      Q_ASSERT( linkGoto != NULL );
-
-      // **FIXME:** _We don't handle this yet!_
-      if ( linkGoto->isExternal() ) break;
-
-      // Jump by page number. Links reckon page numbers starting with 1 so we
-      // subtract to conform with 0-based indexing used by C++.
-      //
-      // **NOTE:**
-      // _There are many details that are not being considered, such as
-      // centering on a specific anchor point and possibly changing the zoom
-      // level rather than just focusing on the center of the target page._
-      const int destPage = linkGoto->destination().pageNumber() - 1;
-
-      // Post an event to the parent scene. The scene then takes care of
-      // notifying objects, such as `PDFDocumentView`, that may want to take
-      // action via a `SIGNAL`.
-      QCoreApplication::postEvent(scene(), new PDFLinkEvent(destPage));
-      break;
-    }
-
-    case Poppler::Link::Browse:
-    {
-      const Poppler::LinkBrowse *linkBrowse = reinterpret_cast<Poppler::LinkBrowse*>(_link);
-      Q_ASSERT( linkBrowse != NULL );
-
-      const QUrl url = QUrl::fromEncoded(linkBrowse->url().toAscii());
-
-      // **FIXME:** _We don't handle this yet!_
-      if( url.scheme() == QString::fromUtf8("file") )
-        break;
-
-
-      // **TODO:**
-      // _Should a graphics item really be making this sort of decision about
-      // how to respond to a URL? It may be better to post some sort of event
-      // and let code outside of the graphics view deal with the situation.
-      //
-      // In any case, `openUrl` can fail and that needs to be handled._
-      QDesktopServices::openUrl(url);
-      break;
-    }
-
-    // Unsupported link types:
-    //
-    //     Poppler::Link::None
-    //     Poppler::Link::Execute
-    //     Poppler::Link::JavaScript
-    //     Poppler::Link::Action
-    //     Poppler::Link::Sound
-    //     Poppler::Link::Movie
-    default:
-      break;
-  }
-
+  // Post an event to the parent scene. The scene then takes care of processing
+  // it further, notifying objects, such as `PDFDocumentView`, that may want to
+  // take action via a `SIGNAL`.
+  // **TODO:** Wouldn't a direct call be more efficient?
+  QCoreApplication::postEvent(scene(), new PDFLinkEvent(_link));
   _activated = false;
 }
 
@@ -1080,7 +1251,7 @@ void PDFLinkGraphicsItem::mouseReleaseEvent(QGraphicsSceneMouseEvent *event)
 
 // A PDF Link event is generated when a link is clicked and contains the page
 // number of the link target.
-PDFLinkEvent::PDFLinkEvent(int a_page) : Super(LinkEvent), pageNum(a_page) {}
+PDFLinkEvent::PDFLinkEvent(const Poppler::Link * link) : Super(LinkEvent), link(link) {}
 
 // Obtain a unique ID for `PDFLinkEvent` that can be used by event handlers to
 // filter out these events.
