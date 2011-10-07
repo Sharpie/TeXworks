@@ -14,6 +14,7 @@
 #include "PDFDocumentView.h"
 #ifdef DEBUG
 #include <QDebug>
+QTime stopwatch;
 #endif
 
 // Some utility functions.
@@ -990,6 +991,12 @@ PDFPageGraphicsItem::PDFPageGraphicsItem(Poppler::Page *a_page, QGraphicsItem *p
   if (_page && !_page->thumbnail().isNull())
     _temporaryPage = QPixmap::fromImage(_page->thumbnail()).scaled(_pageSize.toSize());
   _renderedPage = QPixmap(_pageSize.toSize());
+
+  // So we get information during paint events about what portion of the page
+  // is visible.
+  //
+  // NOTE: This flag needs Qt 4.6 or newer.
+  setFlags(QGraphicsItem::ItemUsesExtendedStyleOption);
 }
 
 QRectF PDFPageGraphicsItem::boundingRect() const { return QRectF(QPointF(0.0, 0.0), _pageSize); }
@@ -1003,6 +1010,7 @@ void PDFPageGraphicsItem::paint(QPainter *painter, const QStyleOptionGraphicsIte
   // Really, there is an X scaling factor and a Y scaling factor, but we assume
   // that the X scaling factor is equal to the Y scaling factor.
   qreal scaleFactor = painter->transform().m11();
+  QTransform scaleT = QTransform::fromScale(scaleFactor, scaleFactor);
   PDFDocumentScene * docScene = qobject_cast<PDFDocumentScene*>(scene());
 
   // If this is the first time this `PDFPageGraphicsItem` has come into view,
@@ -1031,113 +1039,99 @@ void PDFPageGraphicsItem::paint(QPainter *painter, const QStyleOptionGraphicsIte
     _renderedPage.fill();
   }
 
-  // The transformation matrix of the `painter` object contains information
-  // such as the current zoom level of the widget viewing this PDF page. We use
-  // this matrix to position the page and then reset the transformation matrix
-  // to an identity matrix as the page image has already been resized during
-  // rendering.
-  QPointF origin = painter->transform().map(QPointF(0.0, 0.0));
+  if ( _zoomLevel != scaleFactor ) {
+    int i,j;
+    // We apply a scale-only transformation to the bounding box to get the new
+    // page dimensions at the new DPI. The `QRectF` is converted to a `QRect`
+    // by `toAlignedRect` so that we can work in pixels.
+    QRect pageRect = scaleT.mapRect(boundingRect()).toAlignedRect(), pageTile;
 
-  // **TODO:** This way of detecting whether this is a magnifier request
-  // seems a bit hokey; we should probably use some sort of type() method
-  // **TODO:** Find a better way than to repeat the same code twice (once for
-  // the magnifier, and once for the normal display)
-  if (widget && widget->parent() && widget->parent()->inherits("PDFDocumentMagnifierView")) {
-    if ( (_magnifiedZoomLevel != scaleFactor) && not _pageIsRendering )
-    {
-      // Indicate that a render is in progress so that subsequent paint events
-      // won't trigger a re-render. Once `_pageImageGenerator` emits a `finished`
-      // signal, this boolean is cleared.
-      _pageIsRendering = true;
+    _nTile_x = pageRect.width() / TILE_SIZE + 1;
+    _nTile_y = pageRect.height() / TILE_SIZE + 1;
 
-      if (docScene) {
-        // Connect the request object's signal to this object to receive a
-        // notification when the finished page is available.
-        // Note: We don't need to disconnect, as that is handled by Qt
-        // automatically when the request object is destroyed later on
-        // Note: addWorkItem must be separate, as otherwise the processing might
-        // finish before we have actually finished initialization (i.e.,
-        // finished connecting to the signal)
-        PageProcessingRenderPageRequest * request = docScene->processingThread().requestRenderPage(this, scaleFactor);
-        if (request) {
-          connect(request, SIGNAL(pageImageReady(qreal, QImage)), this, SLOT(updateMagnifiedPage(qreal, QImage)));
-          docScene->processingThread().addPageProcessingRequest(request);
+    // TODO:
+    //
+    // There is really no reason to destroy this vector and re-initialize it
+    // every time the page scale changes. Really, no reason to even store the
+    // vector---to figure out a tile's dimensions, we only need four pieces of
+    // information regardless of the zoom level:
+    //
+    //   - The number of rows and columns in the tile map
+    //   - The i,j location of a tile
+    //   - The dimensions of a full tile
+    //   - The dimensions of the bottom right tile.
+    _tilemap.resize( _nTile_x * _nTile_y );
+
+    // The bottom right tile may have a width and height that are smaller---so
+    // we intersect it with the scaled bounding box to get the dimensions. The
+    // width and height of this tile serve as a prototype for other tiles along
+    // clipped edges.
+    pageTile = QRect((_nTile_x - 1) * TILE_SIZE, (_nTile_y - 1) * TILE_SIZE, TILE_SIZE, TILE_SIZE) & pageRect;
+
+    // All tiles that do not lie along the bottom or right edges of the page
+    // will be full size.
+    for( i = 0; i < _nTile_y; ++i ) {
+      for( j = 0; j < _nTile_x; ++j ) {
+        _tilemap[i * _nTile_x + j] = QRect(j * TILE_SIZE, i * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+
+        if( i == (_nTile_y - 1) && j == (_nTile_x - 1) ) {
+          // Last row and column will be the bottom right tile.
+          _tilemap[i * _nTile_x + j] = pageTile;
+        } else if ( i == (_nTile_y - 1) ) {
+          // Last row will have the same height as the bottom right tile.
+          _tilemap[i * _nTile_x + j].setHeight(pageTile.height());
+        } else if ( j == (_nTile_x - 1) ) {
+          // Last column will have the same width as the bottom right tile.
+          _tilemap[i * _nTile_x + j].setWidth(pageTile.width());
         }
+
       }
-
-      _magnifiedZoomLevel = scaleFactor;
     }
-    if ( _pageIsRendering ) {
-      // A new resized page is still rendering, so we "blow up" our current
-      // render and paint that. For performance reasons, we store this so we don't
-      // need to recreate it in every paint event.
-      // Note: Creating the scaled pixmap can take some time at high
-      // magnifications, as can copying the fully rendered page from the rendering
-      // thread into _renderedPage. Both cause a small lag on the UI.
-      // **TODO:** Investigate if it would help to only move pointers around. In
-      // this case, we'd have to take care which thread an image belongs to before
-      // assigning/deallocating.
-      QSizeF scaledSize = painter->transform().mapRect(boundingRect()).size();
 
-      if (_temporaryMagnifiedPage.isNull() || _temporaryMagnifiedPage.size() != scaledSize.toSize())
-        _temporaryMagnifiedPage = _renderedPage.scaled(scaledSize.toSize());
-
-      painter->setTransform(QTransform());
-      painter->drawPixmap(origin, _temporaryMagnifiedPage);
-    } else {
-      painter->setTransform(QTransform());
-      painter->drawPixmap(origin, _magnifiedPage);
-    }
+    _zoomLevel = scaleFactor;
   }
-  else {
-    // We look at the zoom level and render a new page if the zoom has changed or
-    // still has the value of `0.0` set by the constructor.
-    if ( (_zoomLevel != scaleFactor) && not _pageIsRendering )
-    {
-      // Indicate that a render is in progress so that subsequent paint events
-      // won't trigger a re-render. Once `_pageImageGenerator` emits a `finished`
-      // signal, this boolean is cleared.
-      _pageIsRendering = true;
 
-      if (docScene) {
-        // Connect the request object's signal to this object to receive a
-        // notification when the finished page is available.
-        // Note: We don't need to disconnect, as that is handled by Qt
-        // automatically when the request object is destroyed later on
-        // Note: addWorkItem must be separate, as otherwise the processing might
-        // finish before we have actually finished initialization (i.e.,
-        // finished connecting to the signal)
-        PageProcessingRenderPageRequest * request = docScene->processingThread().requestRenderPage(this, scaleFactor);
-        if (request) {
-          connect(request, SIGNAL(pageImageReady(qreal, QImage)), this, SLOT(updateRenderedPage(qreal, QImage)));
-          docScene->processingThread().addPageProcessingRequest(request);
-        }
-      }
+  QImage renderedPage;
+  painter->save();
+    // Clip to the exposed rectangle to prevent unnecessary drawing operations.
+    // This can provide up to a 50% speedup depending on the size of the tile.
+    painter->setClipRect(option->exposedRect);
 
-      _zoomLevel = scaleFactor;
+    // The transformation matrix of the `painter` object contains information
+    // such as the current zoom level of the widget viewing this PDF page. We
+    // throw away the scaling information because that has already been
+    // applied during page rendering.
+    QTransform pageT = painter->transform();
+    pageT.setMatrix( 1, pageT.m12(), pageT.m13(),
+                     pageT.m21(), 1, pageT.m23(),
+                     pageT.m31(), pageT.m32(), pageT.m33() );
+    painter->setTransform(pageT);
+
+#ifdef DEBUG
+    // Pen style used to draw the outline of each tile for debugging purposes.
+    QPen tilePen(Qt::darkGray);
+    tilePen.setStyle(Qt::DashDotLine);
+    painter->setPen(tilePen);
+#endif
+
+    QRect visibleRect = scaleT.mapRect(option->exposedRect).toAlignedRect();
+    foreach( QRect tile, _tilemap ) {
+      if( not tile.intersects(visibleRect) )
+        continue;
+#ifdef DEBUG
+      stopwatch.start();
+#endif
+      // TODO: This needs to be threaded and cached.
+      renderedPage = _page->renderToImage(_dpiX * scaleFactor, _dpiY * scaleFactor,
+          tile.x(), tile.y(), tile.width(), tile.height());
+      painter->drawImage(tile.topLeft(), renderedPage);
+#ifdef DEBUG
+      qDebug() << "Rendered and painted tile in: " << stopwatch.elapsed() << " milliseconds";
+      painter->drawRect(tile);
+#endif
     }
-    if ( _pageIsRendering ) {
-      // A new resized page is still rendering, so we "blow up" our current
-      // render and paint that. For performance reasons, we store this so we don't
-      // need to recreate it in every paint event.
-      // Note: Creating the scaled pixmap can take some time at high
-      // magnifications, as can copying the fully rendered page from the rendering
-      // thread into _renderedPage. Both cause a small lag on the UI.
-      // **TODO:** Investigate if it would help to only move pointers around. In
-      // this case, we'd have to take care which thread an image belongs to before
-      // assigning/deallocating.
-      QSizeF scaledSize = painter->transform().mapRect(boundingRect()).size();
 
-      if (_temporaryPage.isNull() || _temporaryPage.size() != scaledSize.toSize())
-        _temporaryPage = _renderedPage.scaled(scaledSize.toSize());
-
-      painter->setTransform(QTransform());
-      painter->drawPixmap(origin, _temporaryPage);
-    } else {
-      painter->setTransform(QTransform());
-      painter->drawPixmap(origin, _renderedPage);
-    }
-  }
+  painter->restore();
 }
 
 
