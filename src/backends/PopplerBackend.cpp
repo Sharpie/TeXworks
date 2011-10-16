@@ -76,13 +76,9 @@ QImage PopplerPage::renderToImage(double xres, double yres, QRect render_box, bo
 
   if( cache ) {
     PDFPageTile key(xres, yres, render_box, _n);
-    // Don't cache a page if an entry already exists---it will cause the old
-    // entry to be deleted which can invalidate some pointers.
-    if( not _parent->pageCache().contains(key) ) {
-      // Give the cache a copy so that it can take ownership. Use the size of
-      // the image in bytes as the cost.
-      _parent->pageCache().insert(key, new QImage(renderedPage.copy()), renderedPage.byteCount());
-    }
+    QImage * img = new QImage(renderedPage.copy());
+    if (img != _parent->pageCache().setImage(key, img))
+      delete img;
   }
 
   return renderedPage;
