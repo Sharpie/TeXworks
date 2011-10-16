@@ -13,7 +13,11 @@
  */
 
 #include <PDFBackend.h>
+#include <QImage>
+#include <QPainter>
 
+// TODO: Find a better place to put this
+QBrush * pageDummyBrush = NULL;
 
 PDFLinkAnnotation::~PDFLinkAnnotation()
 {
@@ -83,7 +87,7 @@ void PDFPageProcessingThread::addPageProcessingRequest(PageProcessingRequest * r
   // **TODO:** Could it be that we require several concurrent versions of the
   //           same page?
   for (i = _workStack.size() - 1; i >= 0; --i) {
-    if (_workStack[i]->page == request->page && _workStack[i]->type() == request->type()) {
+    if (*(_workStack[i]) == *request) {
       // Using deleteLater() doesn't work because we have no event queue in this
       // thread. However, since the object is still on the stack, it is still
       // sleeping and directly deleting it should therefore be safe.
@@ -98,13 +102,17 @@ void PDFPageProcessingThread::addPageProcessingRequest(PageProcessingRequest * r
   QString jobDesc;
   switch (request->type()) {
     case PageProcessingRequest::LoadLinks:
-      jobDesc = QString::fromUtf8("loading links request");
+      {
+        qDebug() << "new 'loading links request' for page" << request->page->pageNum();
+      }
       break;
     case PageProcessingRequest::PageRendering:
-      jobDesc = QString::fromUtf8("rendering page request");
+      {
+        PageProcessingRenderPageRequest * r = static_cast<PageProcessingRenderPageRequest*>(request);
+        qDebug() << "new 'rendering page request' for page" << request->page->pageNum() << "and tile" << r->render_box;
+      }
       break;
   }
-  qDebug() << "new" << jobDesc << "for page" << request->page->pageNum();
 #endif
 
   if (!isRunning())
@@ -175,6 +183,20 @@ void PDFPageProcessingThread::run()
 // `listener` will need a custom `event` function that is capable of picking up
 // on these events.
 
+bool PageProcessingRequest::operator==(const PageProcessingRequest & r) const
+{
+  // TODO: Should we care about the listener here as well?
+  return (type() == r.type() && page == r.page);
+}
+
+bool PageProcessingRenderPageRequest::operator==(const PageProcessingRequest & r) const
+{
+  if (r.type() != PageRendering)
+    return false;
+  const PageProcessingRenderPageRequest * rr = static_cast<const PageProcessingRenderPageRequest*>(&r);
+  // TODO: Should we care about the listener here as well?
+  return (xres == rr->xres && yres == rr->yres && render_box == rr->render_box && cache == rr->cache);
+}
 
 // ### Custom Event Types
 // These are the events posted by `execute` functions.
@@ -213,6 +235,40 @@ uint qHash(const PDFPageTile &tile)
   return qHash(hash_string);
 }
 
+QImage * PDFPageCache::getImage(const PDFPageTile & tile) const
+{
+  _lock.lockForRead();
+  QImage * retVal = object(tile);
+  _lock.unlock();
+  return retVal;
+}
+
+QImage * PDFPageCache::setImage(const PDFPageTile & tile, QImage * image, const bool overwrite /* = true */)
+{
+  _lock.lockForWrite();
+  QImage * retVal = object(tile);
+  // If the key is not in the cache yet add it. Otherwise overwrite the cached
+  // image but leave the pointer intact as that can be held/used elsewhere
+  if (!retVal) {
+    insert(tile, image, (image ? image->byteCount() : 0));
+    retVal = image;
+  }
+  else if(overwrite) {
+    // TODO: overwriting an image with a different one can change its size (and
+    // therefore its cost in the cache). There doesn't seem to be a method to
+    // hande that in QCache, though, and since we only use one tile size this
+    // shouldn't pose a problem.
+    if (image)
+      *(object(tile)) = *image;
+    else {
+      insert(tile, NULL, 0);
+      retVal = NULL;
+    }
+  }
+  _lock.unlock();
+  return retVal;
+}
+
 
 // PDF ABCs
 // ========
@@ -227,7 +283,7 @@ Document::Document(QString fileName):
   //
   // NOTE: The application seems to exceed 1 GB---usage plateaus at around 2GB. No idea why. Perhaps freed
   // blocks are not garbage collected?? Perhaps my math is off??
-  _pageCache.setMaxCost(1024 * 1024 * 1024);
+  _pageCache.setMaxSize(1024 * 1024 * 1024);
 }
 
 Document::~Document()
@@ -245,6 +301,26 @@ Page::Page(Document *parent, int at):
   _parent(parent),
   _n(at)
 {
+  if (!pageDummyBrush) {
+    pageDummyBrush = new QBrush();
+
+    // Make a texture brush which can be used to print "rendering page" all over
+    // the dummy tiles that are shown while the rendering thread is doing its
+    // work
+    QImage brushTex(1024, 1024, QImage::Format_ARGB32);
+    QRectF textRect;
+    QPainter p;
+    p.begin(&brushTex);
+    p.fillRect(brushTex.rect(), Qt::white);
+    p.setPen(Qt::lightGray);
+    p.drawText(brushTex.rect(), Qt::AlignCenter | Qt::AlignVCenter | Qt::TextSingleLine, QApplication::tr("rendering page"), &textRect);
+    p.end();
+    textRect.adjust(-textRect.width() * .05, -textRect.height() * .1, textRect.width() * .05, textRect.height() * .1);
+    brushTex = brushTex.copy(textRect.toAlignedRect());
+
+    pageDummyBrush->setTextureImage(brushTex);
+    pageDummyBrush->setTransform(QTransform().rotate(-45));
+  }
 }
 
 Page::~Page()
@@ -255,12 +331,114 @@ int Page::pageNum() { return _n; }
 
 QImage *Page::getCachedImage(double xres, double yres, QRect render_box)
 {
-  return _parent->pageCache().object(PDFPageTile(xres, yres, render_box, _n));
+  return _parent->pageCache().getImage(PDFPageTile(xres, yres, render_box, _n));
 }
 
 void Page::asyncRenderToImage(QObject *listener, double xres, double yres, QRect render_box, bool cache)
 {
   _parent->processingThread().requestRenderPage(this, listener, xres, yres, render_box, cache);
+}
+
+bool higherResolutionThan(const PDFPageTile & t1, const PDFPageTile & t2)
+{
+  // Note: We silently assume that xres and yres behave the same way
+  return t1.xres > t2.xres;
+}
+
+QImage* Page::getTileImage(QObject * listener, const double xres, const double yres, QRect render_box /* = QRect() */)
+{
+  // If the render_box is empty, use the whole page
+  if (render_box.isNull())
+    render_box = QRectF(0, 0, pageSizeF().width() * xres / 72., pageSizeF().height() * yres / 72.).toAlignedRect();
+
+  // If the tile is cached, return it
+  QImage * retVal = getCachedImage(xres, yres, render_box);
+  if (retVal)
+    return retVal;
+
+  if (listener) {
+    // Render asyncronously, but add a dummy image to the cache first and return
+    // that in the end
+    // FIXME: Derive the temporary image by scaling existing images in the cache
+    // in some sophisticated way
+
+    // Note: The devil never sleeps; a render can have added an image to the
+    // cache in the meantime which obviously we don't want to overwrite
+    // Note: Start the rendering in the background before constructing the image
+    // to take advantage of multi-core CPUs. Since we hold the write lock here
+    // there's nothing to worry about
+    asyncRenderToImage(listener, xres, yres, render_box, true);
+
+    QImage * tmpImg = new QImage(render_box.width(), render_box.height(), QImage::Format_ARGB32);
+    QPainter p(tmpImg);
+    p.fillRect(tmpImg->rect(), *pageDummyBrush);
+
+    // Look through the cache to find tiles we can reuse (by scaling) for our
+    // dummy tile
+    // TODO: Benchmark this. If it is actualy too slow (i.e., just keeping the
+    // rendered image from popping up due to the write lock we hold) disable it
+    {
+      QList<PDFPageTile> tiles = _parent->pageCache().tiles();
+      for (QList<PDFPageTile>::iterator it = tiles.begin(); it != tiles.end(); ) {
+        if (it->page_num != pageNum()) {
+          it = tiles.erase(it);
+          continue;
+        }
+        // See if it->render_box intersects with render_box (after proper scaling)
+        QRect scaledRect = QTransform::fromScale(xres / it->xres, yres / it->yres).mapRect(it->render_box);
+        if (!scaledRect.intersects(render_box)) {
+          it = tiles.erase(it);
+          continue;
+        }
+        ++it;
+      }
+      // Sort the remaining tiles by size, high-res first
+      qSort(tiles.begin(), tiles.end(), higherResolutionThan);
+      // Finally, crop, scale and paint each image until the whole area is
+      // filled or no images are left in the list
+      QPainterPath clipPath;
+      clipPath.addRect(0, 0, render_box.width(), render_box.height());
+      foreach (PDFPageTile tile, tiles) {
+        QImage * tileImg = _parent->pageCache().getImage(tile);
+        if (!tileImg)
+          continue;
+
+        // cropRect is the part of `tile` that overlaps the tile-to-paint (after
+        // proper scaling).
+        // paintRect is the part `tile` fills of the area we paint to (after
+        // proper scaling).
+        QRect cropRect = QTransform::fromScale(tile.xres / xres, tile.yres / yres).mapRect(render_box).intersected(tile.render_box).translated(-tile.render_box.left(), -tile.render_box.top());
+        QRect paintRect = QTransform::fromScale(xres / tile.xres, yres / tile.yres).mapRect(tile.render_box).intersected(render_box).translated(-render_box.left(), -render_box.top());
+
+        // Get the actual image and paint it onto the dummy tile
+        QImage tmp(tileImg->copy(cropRect).scaled(paintRect.size()));
+        p.setClipPath(clipPath);
+        p.drawImage(paintRect.topLeft(), tmp);
+
+        // Confine the clipping path to the part we have not painted to yet.
+        QPainterPath pp;
+        pp.addRect(paintRect);
+        clipPath = clipPath.subtracted(pp);
+        if (clipPath.isEmpty())
+          break;
+      }
+    }
+    // stop painting or else we couldn't (possibly) delete tmpImg below
+    p.end();
+
+    // Add the dummy tile to the cache
+    // Note: In the meantime the asynchronous rendering could have finished and
+    // insert the final image in the cache---we must handle that case and delete
+    // our temporary image
+    retVal = _parent->pageCache().setImage(PDFPageTile(xres, yres, render_box, _n), tmpImg, false);
+    if (retVal != tmpImg)
+      delete tmpImg;
+    return retVal;
+  }
+  else {
+    renderToImage(xres, yres, render_box, true);
+    return getCachedImage(xres, yres, render_box);
+  }
 }
 
 void Page::asyncLoadLinks(QObject *listener)

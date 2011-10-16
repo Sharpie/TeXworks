@@ -33,15 +33,15 @@ TODO
 ### Required
  - ~~GotoPage should not center on page~~ __DONE__
  - ~~zoom/hand tools~~ __DONE__
- - ctrl+mousewheel should zoom
+ - ~~ctrl+mousewheel should zoom~~ __DONE__
  - ~~maquee zoom (requested by Philip Taylor)~~ __DONE__
  - context menu
  - Flesh out link support
- - Add some loading indicators so that users know something is happening in the
-   background when pages are blank or blurry
+ - ~~Add some loading indicators so that users know something is happening in the
+   background when pages are blank or blurry~~ __DONE__
  - scrolling beyond edge at single page mode (mouse wheel/up/down)
- - disallow keyboard events in document view while magnifier is shown (otherwise
-   one could scroll the canvas without properly adjusting the magnifier)
+ - ~~disallow keyboard events in document view while magnifier is shown (otherwise
+   one could scroll the canvas without properly adjusting the magnifier)~~ __DONE__
  - ~~SyncTeX with signals and slots~~ __DONE__ (actually invoking SyncTeX must
    be implemented separate from the viewer)
  - ~~fit to width/page/~~ __DONE__
@@ -52,6 +52,7 @@ TODO
  - Control memory usage through caching and zoom throttling
  - possibility to abort render requests when page moves out of view (is there a
    way to avoid going through all pages at each scroll event?)
+ - Program segfaults if a page is destroyed while a render request is active
 
 ### Wishlist
  - annotations (popup window)

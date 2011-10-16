@@ -232,9 +232,31 @@ public:
 // object for a `QCache`.
 uint qHash(const PDFPageTile &tile);
 
-// TODO: May need a full subclass to do things like return the nearest image if
-// a specific resolution is not available.
-typedef QCache<PDFPageTile, QImage> PDFPageCache;
+// This class is thread-safe
+class PDFPageCache : protected QCache<PDFPageTile, QImage>
+{
+public:
+  PDFPageCache() { }
+  virtual ~PDFPageCache() { }
+
+  // Note: Each image has a cost of 1
+  int maxSize() const { return maxCost(); }
+  void setMaxSize(const int num) { setMaxCost(num); }
+
+  // Returns the image under the key `tile` or NULL if it doesn't exist
+  QImage * getImage(const PDFPageTile & tile) const;
+  // Returns the pointer to the image in the cache under they key `tile` after
+  // the insertion. If overwrite == true, this will always be image, otherwise
+  // it can be different
+  QImage * setImage(const PDFPageTile & tile, QImage * image, const bool overwrite = true);
+  
+  void lock() const { _lock.lockForRead(); }
+  void unlock() const { _lock.unlock(); }
+
+  QList<PDFPageTile> tiles() const { return keys(); }
+protected:
+  mutable QReadWriteLock _lock;
+};
 
 // FIXME: the program segfaults if the page is destroyed while a page processing
 // request is executed. Note that using QSharedPointer doesn't help here as
@@ -259,10 +281,12 @@ public:
   enum Type { PageRendering, LoadLinks };
 
   virtual ~PageProcessingRequest() { }
-  virtual Type type() = 0;
+  virtual Type type() const = 0;
 
   Page *page;
   QObject *listener;
+  
+  virtual bool operator==(const PageProcessingRequest & r) const;
 };
 
 
@@ -284,7 +308,9 @@ protected:
   bool execute();
 
 public:
-  Type type() { return PageRendering; }
+  Type type() const { return PageRendering; }
+  
+  virtual bool operator==(const PageProcessingRequest & r) const;
 
   double xres, yres;
   QRect render_box;
@@ -325,7 +351,7 @@ protected:
   bool execute();
 
 public:
-  Type type() { return LoadLinks; }
+  Type type() const { return LoadLinks; }
 
 };
 
@@ -421,6 +447,8 @@ public:
 
   int pageNum();
   virtual QSizeF pageSizeF()=0;
+  
+  Document * document() { return _parent; }
 
   virtual QImage renderToImage(double xres, double yres, QRect render_box = QRect(), bool cache = false)=0;
   virtual void asyncRenderToImage(QObject *listener, double xres, double yres, QRect render_box = QRect(), bool cache = false);
@@ -430,7 +458,12 @@ public:
   virtual void asyncLoadLinks(QObject *listener);
 
   QImage *getCachedImage(double xres, double yres, QRect render_box = QRect());
-
+  // Returns either a cached image (if it exists), or triggers a render request.
+  // If listener != NULL, this is an asynchronous render request and the method
+  // returns a dummy image (which is added to the cache to speed up future
+  // requests). Otherwise, the method renders the page synchronously and returns
+  // the result.
+  QImage* getTileImage(QObject * listener, const double xres, const double yres, QRect render_box = QRect());
 };
 
 
