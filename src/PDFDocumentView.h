@@ -36,6 +36,7 @@ class PDFDocumentView : public QGraphicsView {
 
   QRubberBand *_rubberBand;
   QPoint _rubberBandOrigin;
+  QPoint _movePosition;
 
   qreal _zoomLevel;
   int _currentPage, _lastPage;
@@ -83,7 +84,7 @@ signals:
 
   void requestOpenUrl(const QUrl url);
   void requestExecuteCommand(QString command);
-  void requestOpenPdf(QString filename, int page);
+  void requestOpenPdf(QString filename, int page, bool newWindow);
   void contextClick(const int page, const QPointF pos);
 
 protected:
@@ -152,11 +153,13 @@ public:
   // setPosition())
   void prepareToShow();
 
-  QPixmap dropShadow() const;
+  QPixmap& dropShadow();
 
 protected:
   void wheelEvent(QWheelEvent * event) { event->ignore(); }
   void paintEvent(QPaintEvent * event);
+  
+  QPixmap _dropShadow;
 };
 
 // Cannot use QGraphicsGridLayout and similar classes for pages because it only

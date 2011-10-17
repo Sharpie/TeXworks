@@ -123,7 +123,7 @@ class PDFAction
 {
 public:
   enum ActionType {
-    ActionTypeGoTo, ActionTypeGoToR, ActionTypeGoToE, ActionTypeLaunch,
+    ActionTypeGoTo, /*ActionTypeGoToR,*/ ActionTypeGoToE, ActionTypeLaunch,
     ActionTypeThread, ActionTypeURI, ActionTypeSound, ActionTypeMovie,
     ActionTypeHide, ActionTypeNamed, ActionTypeSubmitForm, ActionTypeResetForm,
     ActionTypeImportData, ActionTypeJavaScript, ActionTypeSetOCGState,
@@ -151,13 +151,23 @@ class PDFGotoAction : public PDFAction
 {
 public:
   ActionType type() const { return ActionTypeGoTo; }
-  PDFGotoAction(const PDFDestination destination = PDFDestination()) : _destination(destination) { }
+  PDFGotoAction(const PDFDestination destination = PDFDestination()) : _destination(destination), _isRemote(false), _openInNewWindow(true) { }
 
   PDFDestination destination() const { return _destination; }
+  bool isRemote() const { return _isRemote; }
+  QString filename() const { return _filename; }
+  bool openInNewWindow() const { return _openInNewWindow; }
+
   void setDestination(const PDFDestination destination) { _destination = destination; }
+  void setRemote(const bool remote = true) { _isRemote = remote; }
+  void setFilename(const QString filename) { _filename = filename; }
+  void setOpenInNewWindow(const bool openInNewWindow = true) { _openInNewWindow = openInNewWindow; }
 
 private:
   PDFDestination _destination;
+  bool _isRemote;
+  QString _filename; // relevent only if _isRemote == true; should always refer to a PDF document (for other files, use PDFLaunchAction)
+  bool _openInNewWindow; // relevent only if _isRemote == true
 };
 
 class PDFLaunchAction : public PDFAction
@@ -233,7 +243,7 @@ public:
 uint qHash(const PDFPageTile &tile);
 
 // This class is thread-safe
-class PDFPageCache : protected QCache<PDFPageTile, QImage>
+class PDFPageCache : protected QCache<PDFPageTile, QSharedPointer<QImage> >
 {
 public:
   PDFPageCache() { }
@@ -244,11 +254,11 @@ public:
   void setMaxSize(const int num) { setMaxCost(num); }
 
   // Returns the image under the key `tile` or NULL if it doesn't exist
-  QImage * getImage(const PDFPageTile & tile) const;
+  QSharedPointer<QImage> getImage(const PDFPageTile & tile) const;
   // Returns the pointer to the image in the cache under they key `tile` after
   // the insertion. If overwrite == true, this will always be image, otherwise
   // it can be different
-  QImage * setImage(const PDFPageTile & tile, QImage * image, const bool overwrite = true);
+  QSharedPointer<QImage> setImage(const PDFPageTile & tile, QImage * image, const bool overwrite = true);
   
   void lock() const { _lock.lockForRead(); }
   void unlock() const { _lock.unlock(); }
@@ -457,13 +467,13 @@ public:
   virtual QList< QSharedPointer<PDFLinkAnnotation> > loadLinks() = 0;
   virtual void asyncLoadLinks(QObject *listener);
 
-  QImage *getCachedImage(double xres, double yres, QRect render_box = QRect());
+  QSharedPointer<QImage> getCachedImage(double xres, double yres, QRect render_box = QRect());
   // Returns either a cached image (if it exists), or triggers a render request.
   // If listener != NULL, this is an asynchronous render request and the method
   // returns a dummy image (which is added to the cache to speed up future
   // requests). Otherwise, the method renders the page synchronously and returns
   // the result.
-  QImage* getTileImage(QObject * listener, const double xres, const double yres, QRect render_box = QRect());
+  QSharedPointer<QImage> getTileImage(QObject * listener, const double xres, const double yres, QRect render_box = QRect());
 };
 
 
