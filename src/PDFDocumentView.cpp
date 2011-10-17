@@ -233,6 +233,7 @@ void PDFDocumentView::setMouseMode(const MouseMode newMode)
   _toolAccessors.clear();
   _toolAccessors[Qt::ControlModifier + Qt::LeftButton] = Tool_ContextClick;
   _toolAccessors[Qt::NoModifier + Qt::RightButton] = Tool_ContextMenu;
+  _toolAccessors[Qt::NoModifier + Qt::MiddleButton] = Tool_Move;
   _toolAccessors[Qt::ShiftModifier + Qt::LeftButton] = Tool_ZoomIn;
   _toolAccessors[Qt::AltModifier + Qt::LeftButton] = Tool_ZoomOut;
   // Other tools: Tool_MagnifyingGlass, Tool_MarqueeZoom, Tool_Move
@@ -240,19 +241,16 @@ void PDFDocumentView::setMouseMode(const MouseMode newMode)
   disarmTool(_armedTool);
   switch (newMode) {
     case MouseMode_Move:
-      setDragMode(QGraphicsView::ScrollHandDrag);
       armTool(Tool_Move);
       _toolAccessors[Qt::NoModifier + Qt::LeftButton] = Tool_Move;
       break;
 
     case MouseMode_MarqueeZoom:
-      setDragMode(QGraphicsView::NoDrag);
       armTool(Tool_MarqueeZoom);
       _toolAccessors[Qt::NoModifier + Qt::LeftButton] = Tool_MarqueeZoom;
       break;
 
     case MouseMode_MagnifyingGlass:
-      setDragMode(QGraphicsView::NoDrag);
       armTool(Tool_MagnifyingGlass);
       _toolAccessors[Qt::NoModifier + Qt::LeftButton] = Tool_MagnifyingGlass;
       break;
@@ -293,14 +291,15 @@ void PDFDocumentView::pdfActionTriggered(const PDFAction * action)
   // Propagate link signals so that the outside world doesn't have to care about
   // our internal implementation (document/view structure, etc.)
   switch (action->type()) {
-    // FIXME: Implement remote gotos
-/*    case PDFAction::ActionTypeGoTo:
+    case PDFAction::ActionTypeGoTo:
       {
-        PDFGotoAction * actionGoto = static_cast<PDFGotoAction*>(action);
-        emit requestOpenPdf(linkGoto->fileName(), linkGoto->destination().pageNumber());
+        const PDFGotoAction * actionGoto = static_cast<const PDFGotoAction*>(action);
+        // TODO: Possibly handle other properties of destination() (e.g.,
+        // viewport settings, zoom level, etc.)
+        emit requestOpenPdf(actionGoto->filename(), actionGoto->destination().page(), actionGoto->openInNewWindow());
       }
       break;
-*/    case PDFAction::ActionTypeURI:
+    case PDFAction::ActionTypeURI:
       {
         const PDFURIAction * actionURI = static_cast<const PDFURIAction*>(action);
         emit requestOpenUrl(actionURI->url());
@@ -348,7 +347,7 @@ void PDFDocumentView::paintEvent(QPaintEvent *event)
   // Draw a drop shadow
   if (_magnifier && _magnifier->isVisible()) {
     QPainter p(viewport());
-    QPixmap dropShadow(_magnifier->dropShadow());
+    QPixmap& dropShadow(_magnifier->dropShadow());
     QRect r(QPoint(0, 0), dropShadow.size());
     r.moveCenter(_magnifier->geometry().center());
     p.drawPixmap(r.topLeft(), dropShadow);
@@ -504,6 +503,19 @@ void PDFDocumentView::mouseMoveEvent(QMouseEvent * event)
         viewport()->update();
       }
       break;
+
+    case Tool_Move:
+      // Adapted from <qt>/src/gui/graphicsview/qgraphicsview.cpp @ QGraphicsView::mouseMoveEvent
+      {
+        QScrollBar *hBar = horizontalScrollBar();
+        QScrollBar *vBar = verticalScrollBar();
+        QPoint delta = event->pos() - _movePosition;
+        hBar->setValue(hBar->value() - delta.x());
+        vBar->setValue(vBar->value() - delta.y());
+        _movePosition = event->pos();
+      }
+      break;
+
     default:
       // Nothing to do
       break;
@@ -519,7 +531,11 @@ void PDFDocumentView::mouseReleaseEvent(QMouseEvent * event)
   // mouse tracking we only receive this event if the current widget has grabbed
   // the mouse (i.e., after a mousePressEvent)
 
-  Tool t = _toolAccessors.value(event->buttons() | event->button() | event->modifiers(), Tool_None);
+  Qt::MouseButtons buttons = event->buttons();
+  if (buttons == Qt::NoButton)
+    buttons |= Qt::LeftButton;
+
+  Tool t = _toolAccessors.value(buttons | event->modifiers(), Tool_None);
   if (_armedTool != t) {
     disarmTool(_armedTool);
     armTool(t);
@@ -596,6 +612,16 @@ void PDFDocumentView::startTool(const Tool tool, QMouseEvent * event)
       _rubberBand->show();
       event->accept();
       break;
+    case Tool_Move:
+      // The ideal way to implement the move tool would be to set `dragMode` to
+      // `QGraphicsView::ScrollHandDrag` and use the built-in functionality.
+      // However, that does work only with the left mouse button.
+      //
+      // So... we have to do this ourselves.
+      viewport()->setCursor(Qt::ClosedHandCursor);
+      _movePosition = event->pos();
+      event->accept();
+      break;
     case Tool_MagnifyingGlass:
       _magnifier->prepareToShow();
       _magnifier->setPosition(event->pos());
@@ -628,6 +654,17 @@ void PDFDocumentView::finishTool(const Tool tool, QMouseEvent * event)
         _magnifier->hide();
         viewport()->update();
         event->accept();
+      }
+      break;
+      
+    case Tool_Move:
+      // TODO: Disarming and rearming the current tool is a hack to get the
+      // cursor right if the move tool was accessed through non-standard ways
+      // (e.g., using the middle mouse button)
+      {
+        Tool armedTool = _armedTool;
+        disarmTool(armedTool);
+        armTool(armedTool);
       }
       break;
 
@@ -667,6 +704,17 @@ void PDFDocumentView::abortTool(const Tool tool)
       if (_rubberBand->isVisible()) {
         _rubberBand->hide();
         _rubberBand->setGeometry(QRect());
+      }
+      break;
+      
+    case Tool_Move:
+      // TODO: Disarming and rearming the current tool is a hack to get the
+      // cursor right if the move tool was accessed through non-standard ways
+      // (e.g., using the middle mouse button)
+      {
+        Tool armedTool = _armedTool;
+        disarmTool(armedTool);
+        armTool(armedTool);
       }
       break;
 
@@ -794,6 +842,7 @@ void PDFDocumentMagnifierView::setShape(const PDFDocumentView::MagnifierShape sh
 #endif
       break;
   }
+  _dropShadow = QPixmap();
 }
 
 void PDFDocumentMagnifierView::setSize(const int size)
@@ -807,6 +856,7 @@ void PDFDocumentMagnifierView::setSize(const int size)
       setFixedSize(size, size);
       break;
   }
+  _dropShadow = QPixmap();
 }
 
 void PDFDocumentMagnifierView::paintEvent(QPaintEvent * event)
@@ -859,28 +909,31 @@ void PDFDocumentMagnifierView::paintEvent(QPaintEvent * event)
 }
 
 // Modelled after http://labs.qt.nokia.com/2009/10/07/magnifying-glass
-QPixmap PDFDocumentMagnifierView::dropShadow() const
+QPixmap& PDFDocumentMagnifierView::dropShadow()
 {
-  int padding = 10;
-  QPixmap retVal(width() + 2 * padding, height() + 2 * padding);
+  if (!_dropShadow.isNull())
+    return _dropShadow;
 
-  retVal.fill(Qt::transparent);
+  int padding = 10;
+  _dropShadow = QPixmap(width() + 2 * padding, height() + 2 * padding);
+
+  _dropShadow.fill(Qt::transparent);
 
   switch(_shape) {
     case PDFDocumentView::Magnifier_Rectangle:
       {
         QPainterPath path;
-        QRectF boundingRect(retVal.rect().adjusted(0, 0, -1, -1));
+        QRectF boundingRect(_dropShadow.rect().adjusted(0, 0, -1, -1));
         QLinearGradient gradient(boundingRect.center(), QPointF(0.0, boundingRect.center().y()));
         gradient.setSpread(QGradient::ReflectSpread);
         QGradientStops stops;
         QColor color(Qt::black);
         color.setAlpha(64);
-        stops.append(QGradientStop(1.0 - padding * 2.0 / retVal.width(), color));
+        stops.append(QGradientStop(1.0 - padding * 2.0 / _dropShadow.width(), color));
         color.setAlpha(0);
         stops.append(QGradientStop(1.0, color));
 
-        QPainter shadow(&retVal);
+        QPainter shadow(&_dropShadow);
         shadow.setRenderHint(QPainter::Antialiasing);
 
         // paint horizontal gradient
@@ -900,7 +953,7 @@ QPixmap PDFDocumentMagnifierView::dropShadow() const
         shadow.fillPath(path, gradient);
 
         // paint vertical gradient
-        stops[0].first = 1.0 - padding * 2.0 / retVal.height();
+        stops[0].first = 1.0 - padding * 2.0 / _dropShadow.height();
         gradient.setStops(stops);
 
         path = QPainterPath();
@@ -914,26 +967,26 @@ QPixmap PDFDocumentMagnifierView::dropShadow() const
         path.lineTo(boundingRect.topRight());
         path.closeSubpath();
 
-        gradient.setFinalStop(QPointF(QRectF(retVal.rect()).center().x(), 0.0));
+        gradient.setFinalStop(QPointF(QRectF(_dropShadow.rect()).center().x(), 0.0));
         shadow.fillPath(path, gradient);
       }
       break;
     case PDFDocumentView::Magnifier_Circle:
       {
-        QRadialGradient gradient(QRectF(retVal.rect()).center(), retVal.width() / 2.0, QRectF(retVal.rect()).center());
+        QRadialGradient gradient(QRectF(_dropShadow.rect()).center(), _dropShadow.width() / 2.0, QRectF(_dropShadow.rect()).center());
         QColor color(Qt::black);
         color.setAlpha(0);
         gradient.setColorAt(1.0, color);
         color.setAlpha(64);
-        gradient.setColorAt(1.0 - padding * 2.0 / retVal.width(), color);
+        gradient.setColorAt(1.0 - padding * 2.0 / _dropShadow.width(), color);
         
-        QPainter shadow(&retVal);
+        QPainter shadow(&_dropShadow);
         shadow.setRenderHint(QPainter::Antialiasing);
-        shadow.fillRect(retVal.rect(), gradient);
+        shadow.fillRect(_dropShadow.rect(), gradient);
       }
       break;
   }
-  return retVal;
+  return _dropShadow;
 }
 
 
@@ -981,14 +1034,16 @@ void PDFDocumentScene::handleActionEvent(const PDFActionEvent * action_event)
     case PDFAction::ActionTypeGoTo:
       {
         const PDFGotoAction * actionGoto = static_cast<const PDFGotoAction*>(action);
-        // Jump by page number.
-        //
-        // **NOTE:**
-        // _There are many details that are not being considered, such as
-        // centering on a specific anchor point and possibly changing the zoom
-        // level rather than just focusing on the center of the target page._
-        emit pageChangeRequested(actionGoto->destination().page());
-        return;
+        if (!actionGoto->isRemote()) {
+          // Jump by page number.
+          //
+          // **NOTE:**
+          // _There are many details that are not being considered, such as
+          // centering on a specific anchor point and possibly changing the zoom
+          // level rather than just focusing on the center of the target page._
+          emit pageChangeRequested(actionGoto->destination().page());
+          return;
+        }
       }
       break;
     // Link types that we don't handle here but that may be of interest
@@ -1208,7 +1263,7 @@ void PDFPageGraphicsItem::paint(QPainter *painter, const QStyleOptionGraphicsIte
 #endif
 
     QRect visibleRect = scaleT.mapRect(option->exposedRect).toAlignedRect();
-    QImage *renderedPage = NULL;
+    QSharedPointer<QImage> renderedPage;
     
     int i, imin, imax;
     int j, jmin, jmax;
@@ -1233,25 +1288,14 @@ void PDFPageGraphicsItem::paint(QPainter *painter, const QStyleOptionGraphicsIte
         // avoid doign extra work outside the page
         QRect tile(i * TILE_SIZE, j * TILE_SIZE, TILE_SIZE, TILE_SIZE);
         tile &= pageRect;
-        // See if a copy of the required page render currently exists in the
-        // cache.
-        //
-        // FIXME: The cache still owns the returned pointer---this means it may
-        // decide to delete the object *before* we paint it. Find some way to
-        // guard against this.
-        //
-        // Perhaps store `QSharedPointer<QImage>` instead of `QImage` in the
-        // cache? Then the image won't disappear as long as there is one shared
-        // pointer still in existance.
         renderedPage = _page->getTileImage(this, _dpiX * scaleFactor, _dpiY * scaleFactor, tile);
-        if ( renderedPage ) {
-          // we don't want a finished render thread to change our image while we
-          // draw it
-          _page->document()->pageCache().lock();
-          // renderedPage as returned from getTileImage should always be valid!
+        // we don't want a finished render thread to change our image while we
+        // draw it
+        _page->document()->pageCache().lock();
+        // renderedPage as returned from getTileImage _should_ always be valid
+        if ( renderedPage )
           painter->drawImage(tile.topLeft(), *renderedPage);
-          _page->document()->pageCache().unlock();
-        }
+        _page->document()->pageCache().unlock();
 #ifdef DEBUG
         painter->drawRect(tile);
 #endif
