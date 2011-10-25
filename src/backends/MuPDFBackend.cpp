@@ -30,6 +30,9 @@ MuPDFDocument::MuPDFDocument(QString fileName):
   pdf_load_page_tree(_mupdf_data);
 
   _numPages = pdf_count_pages(_mupdf_data);
+
+
+  loadMetaData();
 }
 
 MuPDFDocument::~MuPDFDocument()
@@ -43,6 +46,202 @@ MuPDFDocument::~MuPDFDocument()
 }
 
 Page *MuPDFDocument::page(int at){ return new MuPDFPage(this, at); }
+
+void MuPDFDocument::loadMetaData()
+{
+  char infoName[] = "Info"; // required because fz_dict_gets is not prototyped to take const char *
+
+  // Note: fz_is_dict(NULL)===0, i.e., it doesn't crash
+  if (!fz_is_dict(_mupdf_data->trailer))
+    return;
+  fz_obj * info = fz_dict_gets(_mupdf_data->trailer, infoName);
+  if (fz_is_dict(info)) { // the `Info` entry is optional
+    for (int i = 0; i < fz_dict_len(info); ++i) {
+      // TODO: Check if fromAscii always gives correct results (the pdf specs
+      // allow for arbitrary 8bit characters - fromAscii can handle them, but
+      // can be codec dependent (see Qt docs)
+      // Note: fz_to_name returns an internal pointer that must not be freed
+      QString key = QString::fromAscii(fz_to_name(fz_dict_get_key(info, i)));
+      // Handle standard keys
+      if (key == QString::fromUtf8("Trapped")) {
+        // TODO: Check if fromAscii always gives correct results (the pdf specs
+        // allow for arbitrary 8bit characters - fromAscii can handle them, but
+        // can be codec dependent (see Qt docs)
+        QString val = QString::fromAscii(fz_to_name(fz_dict_get_val(info, i)));
+        if (val == QString::fromUtf8("True"))
+          _meta_trapped = Trapped_True;
+        else if (val == QString::fromUtf8("False"))
+          _meta_trapped = Trapped_False;
+        else
+          _meta_trapped = Trapped_Unknown;
+      }
+      else {
+        // TODO: Check if fromAscii always gives correct results (the pdf specs
+        // allow for arbitrary 8bit characters - fromAscii can handle them, but
+        // can be codec dependent (see Qt docs)
+        QString val = QString::fromAscii(fz_to_str_buf(fz_dict_get_val(info, i)));
+        if (key == QString::fromUtf8("Title"))
+          _meta_title = val;
+        else if (key == QString::fromUtf8("Author"))
+          _meta_author = val;
+        else if (key == QString::fromUtf8("Subject"))
+          _meta_subject = val;
+        else if (key == QString::fromUtf8("Keywords"))
+          _meta_keywords = val;
+        else if (key == QString::fromUtf8("Creator"))
+          _meta_creator = val;
+        else if (key == QString::fromUtf8("Producer"))
+          _meta_producer = val;
+        else if (key == QString::fromUtf8("CreationDate"))
+          _meta_creationDate = fromPDFDate(val);
+        else if (key == QString::fromUtf8("ModDate"))
+          _meta_modDate = fromPDFDate(val);
+        else
+          _meta_other[key] = val;
+      }
+    }
+  }
+  // FIXME: Implement metadata stream handling (which should probably override
+  // the data in the `Info` dictionary
+}
+
+QList<PDFFontInfo> MuPDFDocument::fonts() const
+{
+  int i;
+  char typeKey[] = "Type";
+  char subtypeKey[] = "Subtype";
+  char descriptorKey[] = "FontDescriptor";
+  char basefontKey[] = "BaseFont";
+  char nameKey[] = "Name";
+  char fontnameKey[] = "FontName";
+  char fontfileKey[] = "FontFile";
+  char fontfile2Key[] = "FontFile2";
+  char fontfile3Key[] = "FontFile3";
+  QList<PDFFontInfo> retVal;
+
+#ifdef DEBUG
+  QTime timer;
+  timer.start();
+#endif
+
+  // Iterate over all objects
+  for (i = 0; i < _mupdf_data->len; ++i) {
+    switch (_mupdf_data->table[i].type) {
+      case 'o':
+      case 'n':
+        {
+        if (!fz_is_dict(_mupdf_data->table[i].obj))
+          continue;
+        if (QString::fromAscii(fz_to_name(fz_dict_gets(_mupdf_data->table[i].obj, typeKey))) != QString::fromUtf8("Font"))
+          continue;
+
+        QString subtype = fz_to_name(fz_dict_gets(_mupdf_data->table[i].obj, subtypeKey));
+
+        // Type0 fonts have no info we need right now---all relevant data is in
+        // its descendant, which again is a dict of type /Font
+        if (subtype == QString::fromUtf8("Type0"))
+          continue;
+
+        PDFFontDescriptor descriptor;
+        PDFFontInfo fi;
+        
+        // Parse the /FontDescriptor dictionary (if it exists)
+        // If not, try to derive the font name from /BaseFont (if it exists) or
+        // /Name
+        fz_obj * desc = fz_dict_gets(_mupdf_data->table[i].obj, descriptorKey);
+        if (fz_is_dict(desc)) {
+          descriptor.setName(QString::fromAscii(fz_to_name(fz_dict_gets(desc, fontnameKey))));
+          fz_obj * ff = fz_dict_gets(desc, fontfileKey);
+          if (fz_is_dict(ff)) {
+            fi.setFontProgramType(PDFFontInfo::ProgramType_Type1);
+            fi.setSource(PDFFontInfo::Source_Embedded);
+          }
+          else {
+            fz_obj * ff = fz_dict_gets(desc, fontfile2Key);
+            if (fz_is_dict(ff)) {
+              fi.setFontProgramType(PDFFontInfo::ProgramType_TrueType);
+              fi.setSource(PDFFontInfo::Source_Embedded);
+            }
+            else {
+              fz_obj * ff = fz_dict_gets(desc, fontfile3Key);
+              if (fz_is_dict(ff)) {
+                QString ffSubtype = fz_to_name(fz_dict_gets(ff, subtypeKey));
+                if (ffSubtype == QString::fromUtf8("Type1C"))
+                  fi.setFontProgramType(PDFFontInfo::ProgramType_Type1CFF);
+                else if (ffSubtype == QString::fromUtf8("CIDFontType0C"))
+                  fi.setFontProgramType(PDFFontInfo::ProgramType_CIDCFF);
+                else if (ffSubtype == QString::fromUtf8("OpenType"))
+                  fi.setFontProgramType(PDFFontInfo::ProgramType_OpenType);
+                fi.setSource(PDFFontInfo::Source_Embedded);
+              }
+              else {
+                // Note: It seems MuPDF handles embedded fonts, and for everything
+                // else uses its own, built-in base14 fonts as substitution (i.e., it
+                // doesn't use fonts from the file system)
+                fi.setFontProgramType(PDFFontInfo::ProgramType_None);
+                fi.setSource(PDFFontInfo::Source_Builtin);
+              }
+            }
+          }
+          // TODO: Parse other entries in /FontDescriptor if ever we need them
+        }
+        else {
+          // Note: It seems MuPDF handles embedded fonts, and for everything
+          // else uses its own, built-in base14 fonts as substitution (i.e., it
+          // doesn't use fonts from the file system)
+          fi.setFontProgramType(PDFFontInfo::ProgramType_None);
+          fi.setSource(PDFFontInfo::Source_Builtin);
+
+          fz_obj * basefont = fz_dict_gets(_mupdf_data->table[i].obj, basefontKey);
+          if (fz_is_name(basefont))
+            descriptor.setName(QString::fromAscii(fz_to_name(basefont)));
+          else
+            descriptor.setName(QString::fromAscii(fz_to_name(fz_dict_gets(_mupdf_data->table[i].obj, nameKey))));
+        }
+        fi.setDescriptor(descriptor);
+
+        // Set the font type
+        if (subtype == QString::fromUtf8("Type1")) {
+          fi.setFontType(PDFFontInfo::FontType_Type1);
+          fi.setCIDType(PDFFontInfo::CIDFont_None);
+        }
+        else if (subtype == QString::fromUtf8("MMType1")) {
+          fi.setFontType(PDFFontInfo::FontType_MMType1);
+          fi.setCIDType(PDFFontInfo::CIDFont_None);
+        }
+        else if (subtype == QString::fromUtf8("Type3")) {
+          fi.setFontType(PDFFontInfo::FontType_Type3);
+          fi.setCIDType(PDFFontInfo::CIDFont_None);
+        }
+        else if (subtype == QString::fromUtf8("TrueType")) {
+          fi.setFontType(PDFFontInfo::FontType_TrueType);
+          fi.setCIDType(PDFFontInfo::CIDFont_None);
+        }
+        else if (subtype == QString::fromUtf8("CIDFontType0")) {
+          fi.setFontType(PDFFontInfo::FontType_Type0);
+          fi.setCIDType(PDFFontInfo::CIDFont_Type0);
+        }
+        else if (subtype == QString::fromUtf8("CIDFontType2")) {
+          fi.setFontType(PDFFontInfo::FontType_Type0);
+          fi.setCIDType(PDFFontInfo::CIDFont_Type2);
+        }
+
+        retVal << fi;
+        }
+        break;
+      case 0:
+      case 'f':
+      default:
+        continue;
+    }
+  }
+
+#ifdef DEBUG
+  qDebug() << "loaded fonts in" << timer.elapsed() << "ms";
+#endif
+
+  return retVal;
+}
 
 
 // Page Class

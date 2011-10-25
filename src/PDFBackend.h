@@ -28,6 +28,9 @@
 class Page;
 class Document;
 
+// TODO: Find a better place to put this
+QDateTime fromPDFDate(QString pdfDate);
+
 
 // FIXME: Annotations and Actions should probably be moved to separate files
 
@@ -74,7 +77,7 @@ public:
   virtual QString contents() const { return _contents; }
   virtual Page * page() const { return _page; }
   virtual QString name() const { return _name; }
-  virtual QString lastModified() const { return _lastModified; }
+  virtual QDateTime lastModified() const { return _lastModified; }
   virtual QFlags<AnnotationFlags> flags() const { return _flags; }
   virtual QFlags<AnnotationFlags>& flags() { return _flags; }  
   virtual QColor color() const { return _color; }
@@ -83,7 +86,7 @@ public:
   virtual void setContents(const QString contents) { _contents = contents; }
   virtual void setPage(Page * page) { _page = page; }
   virtual void setName(const QString name) { _name = name; }
-  virtual void setLastModified(const QString lastModified) { _lastModified = lastModified; }
+  virtual void setLastModified(const QDateTime lastModified) { _lastModified = lastModified; }
   virtual void setColor(const QColor color) { _color = color; }
 
 protected:
@@ -91,7 +94,7 @@ protected:
   QString _contents; // optional
   Page * _page; // optional; since PDF 1.3
   QString _name; // optional; since PDF 1.4
-  QString _lastModified; // optional; since PDF 1.1
+  QDateTime _lastModified; // optional; since PDF 1.1
   // TODO: _flags, _appearance, _appearanceState, _border, _structParent, _optContent
   QFlags<AnnotationFlags> _flags;
   // QList<???> _appearance;
@@ -131,14 +134,18 @@ public:
   };
 
   virtual ActionType type() const = 0;
+  virtual PDFAction * clone() const = 0;
 };
 
 class PDFURIAction : public PDFAction
 {
 public:
-  ActionType type() const { return ActionTypeURI; }
   PDFURIAction(const QUrl url) : _url(url), _isMap(false) { }
+  PDFURIAction(const PDFURIAction & a) : _url(a._url), _isMap(a._isMap) { }
   
+  ActionType type() const { return ActionTypeURI; }
+  PDFAction * clone() const { return new PDFURIAction(*this); }
+
   // FIXME: handle _isMap (see PDF 1.7 specs)
   QUrl url() const { return _url; }
 
@@ -150,8 +157,11 @@ private:
 class PDFGotoAction : public PDFAction
 {
 public:
-  ActionType type() const { return ActionTypeGoTo; }
   PDFGotoAction(const PDFDestination destination = PDFDestination()) : _destination(destination), _isRemote(false), _openInNewWindow(true) { }
+  PDFGotoAction(const PDFGotoAction & a) : _destination(a._destination), _isRemote(a._isRemote), _filename(a._filename), _openInNewWindow(a._openInNewWindow) { }
+
+  ActionType type() const { return ActionTypeGoTo; }
+  PDFAction * clone() const { return new PDFGotoAction(*this); }
 
   PDFDestination destination() const { return _destination; }
   bool isRemote() const { return _isRemote; }
@@ -173,8 +183,10 @@ private:
 class PDFLaunchAction : public PDFAction
 {
 public:
-  ActionType type() const { return ActionTypeLaunch; }
   PDFLaunchAction(const QString command) : _command(command) { }
+
+  ActionType type() const { return ActionTypeLaunch; }
+  PDFAction * clone() const { return new PDFLaunchAction(*this); }
   
   QString command() const { return _command; }
   void setCommand(const QString command) { _command = command; }
@@ -213,6 +225,108 @@ private:
   QPolygonF _quadPoints;
   PDFAction * _actionOnActivation;
 };
+
+class PDFFontDescriptor
+{
+public:
+  enum FontStretch { FontStretch_UltraCondensed, FontStretch_ExtraCondensed, \
+                     FontStretch_Condensed, FontStretch_SemiCondensed, \
+                     FontStretch_Normal, FontStretch_SemiExpanded, \
+                     FontStretch_Expanded, FontStretch_ExtraExpanded, \
+                     FontStretch_UltraExpanded };
+  enum Flag { Flag_FixedPitch = 0x01, Flag_Serif = 0x02, Flag_Symbolic = 0x04, \
+              Flag_Script = 0x08, Flag_Nonsymbolic = 0x20, Flag_Italic = 0x40, \
+              Flag_AllCap = 0x10000, Flag_SmallCap = 0x20000, \
+              Flag_ForceBold = 0x40000 };
+  Q_DECLARE_FLAGS(Flags, Flag)
+
+  PDFFontDescriptor(const QString fontName = QString());
+  virtual ~PDFFontDescriptor() { }
+
+  bool isSubset() const;
+
+  QString name() const { return _name; }
+  // pureName() removes the subset tag
+  QString pureName() const;
+
+  void setName(const QString name) { _name = name; }
+  // TODO: Accessor methods for all other properties
+
+protected:
+  // From pdf specs
+  QString _name;
+  QString _family;
+  enum FontStretch _stretch;
+  int _weight;
+  Flags _flags;
+  QRectF _bbox;
+  float _italicAngle;
+  float _ascent;
+  float _descent;
+  float _leading;
+  float _capHeight;
+  float _xHeight;
+  float _stemV;
+  float _stemH;
+  float _avgWidth;
+  float _maxWidth;
+  float _missingWidth;
+  QString _charSet;
+
+  // From pdf specs for CID fonts only
+  // _style
+  // _lang
+  // _fD
+  // _CIDSet
+};
+
+// Note: This is a hack, but since all the information (with the exception of
+// the type of font) we use (and that is provided by poppler) is encapsulated in
+// PDFFontDescriptor, there is no use right now to completely implement all the
+// different font structures
+class PDFFontInfo
+{
+public:
+  enum FontType { FontType_Type0, FontType_Type1, FontType_MMType1, \
+                  FontType_Type3, FontType_TrueType };
+  enum CIDFontType { CIDFont_None, CIDFont_Type0, CIDFont_Type2 };
+  enum FontProgramType { ProgramType_None, ProgramType_Type1, \
+                         ProgramType_TrueType, ProgramType_Type1CFF, \
+                         ProgramType_CIDCFF, ProgramType_OpenType };
+  enum FontSource { Source_Embedded, Source_File, Source_Builtin };
+  
+  PDFFontInfo() { };
+  virtual ~PDFFontInfo() { };
+  
+  FontType fontType() const { return _fontType; }
+  CIDFontType CIDType() const { return _CIDType; }
+  FontProgramType fontProgramType() const { return _fontProgramType; }
+  PDFFontDescriptor descriptor() const { return _descriptor; }
+  // returns the path to the file used for rendering this font, or an invalid
+  // QFileInfo for embedded fonts
+  QFileInfo fileName() const { return _substitutionFile; }
+
+  bool isSubset() const { return _descriptor.isSubset(); }
+  FontSource source() const { return _source; }
+
+  // TODO: Implement some advanced logic; e.g., non-embedded fonts have no font
+  // program type
+  void setFontType(const FontType fontType) { _fontType = fontType; }
+  void setCIDType(const CIDFontType CIDType) { _CIDType = CIDType; }
+  void setFontProgramType(const FontProgramType programType) { _fontProgramType = programType; }
+  void setDescriptor(const PDFFontDescriptor descriptor) { _descriptor = descriptor; }
+  void setFileName(const QFileInfo file) { _source = Source_File; _substitutionFile = file; }
+  void setSource(const FontSource source) { _source = source; }
+
+protected:
+  FontSource _source;
+  PDFFontDescriptor _descriptor;
+  QFileInfo _substitutionFile;
+  FontType _fontType;
+  CIDFontType _CIDType;
+  FontProgramType _fontProgramType;
+};
+
 
 class PDFPageTile
 {
@@ -415,6 +529,46 @@ private:
 
 };
 
+class PDFToCItem
+{
+public:
+  enum PDFToCItemFlag { Flag_Italic = 0x1, Flag_Bold = 0x2 };
+  Q_DECLARE_FLAGS(PDFToCItemFlags, PDFToCItemFlag)
+
+  PDFToCItem(const QString label = QString()) : _label(label), _isOpen(false), _action(NULL) { }
+  PDFToCItem(const PDFToCItem & o) : _label(o._label), _isOpen(o._isOpen), _color(o._color), _children(o._children), _flags(o._flags) {
+    _action = (o._action ? o._action->clone() : NULL);
+  }
+  virtual ~PDFToCItem() { if (_action) delete _action; }
+
+  QString label() const { return _label; }
+  bool isOpen() const { return _isOpen; }
+  PDFAction * action() const { return _action; }
+  QColor color() const { return _color; }
+  const QList<PDFToCItem> & children() const { return _children; }
+  QList<PDFToCItem> & children() { return _children; }
+  PDFToCItemFlags flags() const { return _flags; }
+  PDFToCItemFlags & flags() { return _flags; }
+  
+  void setLabel(const QString label) { _label = label; }
+  void setOpen(const bool isOpen = true) { _isOpen = isOpen; }
+  void setAction(PDFAction * action) {
+    if (_action)
+      delete _action;
+    _action = action;
+  }
+  void setColor(const QColor color) { _color = color; }
+
+protected:
+  QString _label;
+  bool _isOpen; // derived from the sign of the `Count` member of the outline item dictionary
+  PDFAction * _action; // if the `Dest` member of the outline item dictionary is set, it must be converted to a PDFGotoAction
+  QColor _color;
+  QList<PDFToCItem> _children;
+  PDFToCItemFlags _flags;
+};
+
+typedef QList<PDFToCItem> PDFToC;
 
 // PDF ABCs
 // ========
@@ -427,12 +581,9 @@ class Document
 {
   friend class Page;
 
-protected:
-  int _numPages;
-  PDFPageProcessingThread _processingThread;
-  PDFPageCache _pageCache;
-
 public:
+  enum TrappedState { Trapped_Unknown, Trapped_True, Trapped_False };
+
   Document(QString fileName);
   virtual ~Document();
 
@@ -441,7 +592,39 @@ public:
   PDFPageCache& pageCache();
 
   virtual Page *page(int at)=0;
+  // Override in derived class if it provides access to the document outline
+  // strutures of the pdf file.
+  virtual PDFToC toc() const { return PDFToC(); }
+  virtual QList<PDFFontInfo> fonts() const { return QList<PDFFontInfo>(); }
 
+  // <metadata>
+  QString title() const { return _meta_title; }
+  QString author() const { return _meta_author; }
+  QString subject() const { return _meta_subject; }
+  QString keywords() const { return _meta_keywords; }
+  QString creator() const { return _meta_creator; }
+  QString producer() const { return _meta_producer; }
+  QDateTime creationDate() const { return _meta_creationDate; }
+  QDateTime modDate() const { return _meta_modDate; }
+  TrappedState trapped() const { return _meta_trapped; }
+  QMap<QString, QString> metaDataOther() const { return _meta_other; }
+  // </metadata>
+
+protected:
+  int _numPages;
+  PDFPageProcessingThread _processingThread;
+  PDFPageCache _pageCache;
+
+  QString _meta_title;
+  QString _meta_author;
+  QString _meta_subject;
+  QString _meta_keywords;
+  QString _meta_creator;
+  QString _meta_producer;
+  QDateTime _meta_creationDate;
+  QDateTime _meta_modDate;
+  TrappedState _meta_trapped;
+  QMap<QString, QString> _meta_other;
 };
 
 class Page

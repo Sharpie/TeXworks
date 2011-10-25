@@ -15,6 +15,16 @@
 // NOTE: `PopplerBackend.h` is included via `PDFBackend.h`
 #include <PDFBackend.h>
 
+// TODO: Find a better place to put this
+PDFDestination toPDFDestination(const Poppler::LinkDestination & dest)
+{
+  PDFDestination retVal(dest.pageNumber() - 1);
+  // FIXME: viewport, zoom, fitting, etc.
+  return retVal;
+}
+
+
+
 // Document Class
 // ==============
 PopplerDocument::PopplerDocument(QString fileName):
@@ -31,6 +41,50 @@ PopplerDocument::PopplerDocument(QString fileName):
   // Make things look pretty.
   _poppler_doc->setRenderHint(Poppler::Document::Antialiasing);
   _poppler_doc->setRenderHint(Poppler::Document::TextAntialiasing);
+
+  // Load meta data
+  QStringList metaKeys = _poppler_doc->infoKeys();
+  if (metaKeys.contains(QString::fromUtf8("Title"))) {
+    _meta_title = _poppler_doc->info(QString::fromUtf8("Title"));
+    metaKeys.removeAll(QString::fromUtf8("Title"));
+  }
+  if (metaKeys.contains(QString::fromUtf8("Author"))) {
+    _meta_author = _poppler_doc->info(QString::fromUtf8("Author"));
+    metaKeys.removeAll(QString::fromUtf8("Author"));
+  }
+  if (metaKeys.contains(QString::fromUtf8("Subject"))) {
+    _meta_subject = _poppler_doc->info(QString::fromUtf8("Subject"));
+    metaKeys.removeAll(QString::fromUtf8("Subject"));
+  }
+  if (metaKeys.contains(QString::fromUtf8("Keywords"))) {
+    _meta_keywords = _poppler_doc->info(QString::fromUtf8("Keywords"));
+    metaKeys.removeAll(QString::fromUtf8("Keywords"));
+  }
+  if (metaKeys.contains(QString::fromUtf8("Creator"))) {
+    _meta_creator = _poppler_doc->info(QString::fromUtf8("Creator"));
+    metaKeys.removeAll(QString::fromUtf8("Creator"));
+  }
+  if (metaKeys.contains(QString::fromUtf8("Producer"))) {
+    _meta_producer = _poppler_doc->info(QString::fromUtf8("Producer"));
+    metaKeys.removeAll(QString::fromUtf8("Producer"));
+  }
+  if (metaKeys.contains(QString::fromUtf8("CreationDate"))) {
+    _meta_creationDate = fromPDFDate(_poppler_doc->info(QString::fromUtf8("CreationDate")));
+    metaKeys.removeAll(QString::fromUtf8("CreationDate"));
+  }
+  if (metaKeys.contains(QString::fromUtf8("ModDate"))) {
+    _meta_modDate = fromPDFDate(_poppler_doc->info(QString::fromUtf8("ModDate")));
+    metaKeys.removeAll(QString::fromUtf8("ModDate"));
+  }
+
+  // Note: Poppler doesn't handle the meta data key "Trapped" correctly, as that
+  // has a value of type `name` (/True, /False, or /Unknown) which doesn't get
+  // converted to a string representation properly.
+  _meta_trapped = Trapped_Unknown;
+    metaKeys.removeAll(QString::fromUtf8("Trapped"));
+  
+  foreach (QString key, metaKeys)
+    _meta_other[key] = _poppler_doc->info(key);
 }
 
 PopplerDocument::~PopplerDocument()
@@ -39,6 +93,138 @@ PopplerDocument::~PopplerDocument()
 
 Page *PopplerDocument::page(int at){ return new PopplerPage(this, at); }
 
+void PopplerDocument::recursiveConvertToC(QList<PDFToCItem> & items, QDomNode node) const
+{
+  while (!node.isNull()) {
+    PDFToCItem newItem(node.nodeName());
+
+    QDomNamedNodeMap attributes = node.attributes();
+    newItem.setOpen(attributes.namedItem(QString::fromUtf8("Open")).nodeValue() == QString::fromUtf8("true"));
+    // Note: color and flags are not supported by poppler
+
+    PDFGotoAction * action = NULL;
+    QString val = attributes.namedItem(QString::fromUtf8("Destination")).nodeValue();
+    if (!val.isEmpty())
+      action = new PDFGotoAction(toPDFDestination(Poppler::LinkDestination(val)));
+    else {
+      val = attributes.namedItem(QString::fromUtf8("DestinationName")).nodeValue();
+      if (!val.isEmpty() && _poppler_doc) {
+        Poppler::LinkDestination * dest = _poppler_doc->linkDestination(val);
+        if (dest) {
+          action = new PDFGotoAction(toPDFDestination(*dest));
+          delete dest;
+        }
+      }
+    }
+
+    val = attributes.namedItem(QString::fromUtf8("ExternalFileName")).nodeValue();
+    if (action) {
+      action->setOpenInNewWindow(false);
+      if (!val.isEmpty()) {
+        action->setRemote();
+        action->setFilename(val);
+      }
+    }
+    newItem.setAction(action);
+
+    recursiveConvertToC(newItem.children(), node.firstChild());
+    items << newItem;
+    node = node.nextSibling();
+  }
+}
+
+PDFToC PopplerDocument::toc() const
+{
+  PDFToC retVal;
+  if (!_poppler_doc)
+    return retVal;
+
+  QDomDocument * toc = _poppler_doc->toc();
+  if (!toc)
+    return retVal;
+  recursiveConvertToC(retVal, toc->firstChild());
+  delete toc;
+  return retVal;
+}
+
+QList<PDFFontInfo> PopplerDocument::fonts() const
+{
+  QList<PDFFontInfo> retVal;
+  if (!_poppler_doc)
+    return retVal;
+
+  foreach(Poppler::FontInfo popplerFontInfo, _poppler_doc->fonts()) {
+    PDFFontInfo fi;
+    if (popplerFontInfo.isEmbedded())
+      fi.setSource(PDFFontInfo::Source_Embedded);
+    else
+      fi.setFileName(popplerFontInfo.file());
+    fi.setDescriptor(PDFFontDescriptor(popplerFontInfo.name()));
+
+    switch (popplerFontInfo.type()) {
+      case Poppler::FontInfo::Type1:
+        fi.setFontType(PDFFontInfo::FontType_Type1);
+        fi.setCIDType(PDFFontInfo::CIDFont_None);
+        fi.setFontProgramType(PDFFontInfo::ProgramType_Type1);
+        break;
+      case Poppler::FontInfo::Type1C:
+        fi.setFontType(PDFFontInfo::FontType_Type1);
+        fi.setCIDType(PDFFontInfo::CIDFont_None);
+        fi.setFontProgramType(PDFFontInfo::ProgramType_Type1CFF);
+        break;
+      case Poppler::FontInfo::Type1COT:
+        fi.setFontType(PDFFontInfo::FontType_Type1);
+        fi.setCIDType(PDFFontInfo::CIDFont_None);
+        fi.setFontProgramType(PDFFontInfo::ProgramType_OpenType); // speculation
+        break;
+      case Poppler::FontInfo::Type3:
+        fi.setFontType(PDFFontInfo::FontType_Type3);
+        fi.setCIDType(PDFFontInfo::CIDFont_None);
+        fi.setFontProgramType(PDFFontInfo::ProgramType_None); // probably wrong!
+        break;
+      case Poppler::FontInfo::TrueType:
+        fi.setFontType(PDFFontInfo::FontType_TrueType);
+        fi.setCIDType(PDFFontInfo::CIDFont_None);
+        fi.setFontProgramType(PDFFontInfo::ProgramType_TrueType);
+        break;
+      case Poppler::FontInfo::TrueTypeOT:
+        fi.setFontType(PDFFontInfo::FontType_TrueType);
+        fi.setCIDType(PDFFontInfo::CIDFont_None);
+        fi.setFontProgramType(PDFFontInfo::ProgramType_OpenType);
+        break;
+      case Poppler::FontInfo::CIDType0:
+        fi.setFontType(PDFFontInfo::FontType_Type0);
+        fi.setCIDType(PDFFontInfo::CIDFont_Type0);
+        fi.setFontProgramType(PDFFontInfo::ProgramType_None); // probably wrong!
+        break;
+      case Poppler::FontInfo::CIDType0C:
+        fi.setFontType(PDFFontInfo::FontType_Type0);
+        fi.setCIDType(PDFFontInfo::CIDFont_Type0);
+        fi.setFontProgramType(PDFFontInfo::ProgramType_CIDCFF);
+        break;
+      case Poppler::FontInfo::CIDType0COT:
+        fi.setFontType(PDFFontInfo::FontType_Type0);
+        fi.setCIDType(PDFFontInfo::CIDFont_Type0);
+        fi.setFontProgramType(PDFFontInfo::ProgramType_OpenType);
+        break;
+      case Poppler::FontInfo::CIDTrueType:
+        fi.setFontType(PDFFontInfo::FontType_Type0);
+        fi.setCIDType(PDFFontInfo::CIDFont_Type2); // speculation
+        fi.setFontProgramType(PDFFontInfo::ProgramType_TrueType);
+        break;
+      case Poppler::FontInfo::CIDTrueTypeOT:
+        fi.setFontType(PDFFontInfo::FontType_Type0);
+        fi.setCIDType(PDFFontInfo::CIDFont_Type2); // speculation
+        fi.setFontProgramType(PDFFontInfo::ProgramType_OpenType);
+        break;
+      case Poppler::FontInfo::unknown:
+      default:
+        continue;
+    }
+    retVal << fi;
+  }
+  return retVal;
+}
 
 // Page Class
 // ==========
@@ -110,9 +296,7 @@ QList< QSharedPointer<PDFLinkAnnotation> > PopplerPage::loadLinks()
       case Poppler::Link::Goto:
         {
           Poppler::LinkGoto * popplerGoto = static_cast<Poppler::LinkGoto *>(popplerLink);
-          PDFDestination dest(popplerGoto->destination().pageNumber() - 1);
-          // FIXME: Convert viewport, zoom, fitting, etc.
-          PDFGotoAction * action = new PDFGotoAction(dest);
+          PDFGotoAction * action = new PDFGotoAction(toPDFDestination(popplerGoto->destination()));
           if (popplerGoto->isExternal()) {
             // TODO: Verify that Poppler::LinkGoto only refers to pdf files
             // (for other file types we would need PDFLaunchAction)
@@ -159,7 +343,7 @@ QList< QSharedPointer<PDFLinkAnnotation> > PopplerPage::loadLinks()
       Poppler::LinkAnnotation * popplerLinkAnnot = static_cast<Poppler::LinkAnnotation *>(popplerAnnot);
       link->setContents(popplerLinkAnnot->contents());
       link->setName(popplerLinkAnnot->uniqueName());
-      link->setLastModified(popplerLinkAnnot->modificationDate().toString(Qt::ISODate));
+      link->setLastModified(popplerLinkAnnot->modificationDate());
       // TODO: Does poppler provide the color anywhere?
       // FIXME: Convert flags
 

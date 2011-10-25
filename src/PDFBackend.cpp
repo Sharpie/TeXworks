@@ -19,6 +19,74 @@
 // TODO: Find a better place to put this
 QBrush * pageDummyBrush = NULL;
 
+QDateTime fromPDFDate(QString pdfDate)
+{
+  QDate date;
+  QTime time;
+  QString format;
+  QDateTime retVal;
+  int sign = 0;
+  int hourOffset, minuteOffset;
+  bool ok;
+
+  // "D:" prefix is strongly recommended, but optional; we don't need it here
+  if (pdfDate.startsWith(QString::fromUtf8("D:")))
+    pdfDate.remove(0, 2);
+
+  // Parse the date
+  if (pdfDate.length() < 4)
+    return QDateTime();
+  format = QString::fromUtf8("yyyy");
+  if (pdfDate.length() >= 6)
+    format += QString::fromUtf8("MM");
+  if (pdfDate.length() >= 8)
+    format += QString::fromUtf8("dd");
+  date = QDate::fromString(pdfDate.left(format.length()), format);
+  pdfDate.remove(0, format.length());
+
+  // Parse the time
+  if (pdfDate.length() < 2)
+    return QDateTime(date, time);
+  format = QString::fromUtf8("hh");
+  if (pdfDate.length() >= 4)
+    format += QString::fromUtf8("mm");
+  if (pdfDate.length() >= 6)
+    format += QString::fromUtf8("ss");
+  time = QTime::fromString(pdfDate.left(format.length()), format);
+  pdfDate.remove(0, format.length());
+
+  // Parse time zone data
+  if (pdfDate.length() == 0)
+    return QDateTime(date, time);
+  switch (pdfDate[0].toAscii()) {
+    case 'Z':
+      return QDateTime(date, time, Qt::UTC).toLocalTime();
+    case '+':
+      // Note: A `+` signifies that pdfDate is later than UTC. Since we will
+      // specify the QDateTime in UTC below, we have to _subtract_ the offset
+      sign = -1;
+      break;
+    case '-':
+      sign = +1;
+      break;
+    default:
+      return QDateTime(date, time);
+  }
+  pdfDate.remove(0, 1);
+  if (pdfDate.length() < 3 || pdfDate[2] != QChar::fromAscii('\''))
+    return QDateTime(date, time);
+  hourOffset = pdfDate.left(2).toInt(&ok);
+  if (!ok)
+    return QDateTime(date, time);
+  pdfDate.remove(0, 3);
+  if (pdfDate.length() >= 3 && pdfDate[2] ==  QChar::fromAscii('\''))
+    minuteOffset = pdfDate.left(2).toInt();
+  return QDateTime(date, time, Qt::UTC).addSecs(sign * (hourOffset * 3600 + minuteOffset * 60)).toLocalTime();
+}
+
+// Annotations
+// =================
+
 PDFLinkAnnotation::~PDFLinkAnnotation()
 {
   if (_actionOnActivation)
@@ -44,6 +112,49 @@ void PDFLinkAnnotation::setActionOnActivation(PDFAction * const action)
     delete _actionOnActivation;
   _actionOnActivation = action;
 }
+
+// Fonts
+// =================
+
+PDFFontDescriptor::PDFFontDescriptor(const QString fontName /* = QString() */) :
+  _name(fontName),
+  _stretch(FontStretch_Normal),
+  _weight(400),
+  _italicAngle(0),
+  _ascent(0),
+  _descent(0),
+  _leading(0),
+  _capHeight(0),
+  _xHeight(0),
+  _stemV(0),
+  _stemH(0),
+  _avgWidth(0),
+  _maxWidth(0),
+  _missingWidth(0)
+{
+}
+
+bool PDFFontDescriptor::isSubset() const
+{
+  // Subset fonts have a tag of 6 upper-case letters, followed by a '+',
+  // prefixed to the font name
+  if (_name.length() < 7 || _name[6] != QChar::fromAscii('+'))
+    return false;
+  for (int i = 0; i < 6; ++i) {
+    if (!_name[i].isUpper())
+      return false;
+  }
+  return true;
+}
+
+QString PDFFontDescriptor::pureName() const
+{
+  if (!isSubset())
+    return _name;
+  else
+    return _name.mid(7);
+}
+
 
 // Backend Rendering
 // =================

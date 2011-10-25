@@ -122,6 +122,35 @@ void PDFDocumentView::setPageMode(PageMode pageMode)
   ensureVisible(viewRect, 0, 0);
 }
 
+// TODO: These could possibly be simplified if all dock widgets were derived
+// from a common ancestral class (which provides an overrideable
+// setDataFromDocument method). Question is: can we assure that we never need
+// anything else?
+QDockWidget * PDFDocumentView::tocDockWidget(QWidget * parent)
+{
+  PDFToCDockWidget * dock = new PDFToCDockWidget(parent);
+  connect(dock, SIGNAL(actionTriggered(const PDFAction*)), this, SLOT(pdfActionTriggered(const PDFAction*)));
+  if (_pdf_scene && _pdf_scene->document())
+    dock->setToCData(_pdf_scene->document()->toc());
+  return dock;
+}
+
+QDockWidget * PDFDocumentView::metaDataDockWidget(QWidget * parent)
+{
+  PDFMetaDataDockWidget * dock = new PDFMetaDataDockWidget(parent);
+  if (_pdf_scene && _pdf_scene->document())
+    dock->setMetaDataFromDocument(_pdf_scene->document());
+  return dock;
+}
+
+QDockWidget * PDFDocumentView::fontsDockWidget(QWidget * parent)
+{
+  PDFFontsDockWidget * dock = new PDFFontsDockWidget(parent);
+  if (_pdf_scene && _pdf_scene->document())
+    dock->setFontsDataFromDocument(_pdf_scene->document());
+  return dock;
+}
+  
 
 // Public Slots
 // ------------
@@ -316,7 +345,13 @@ void PDFDocumentView::pdfActionTriggered(const PDFAction * action)
         const PDFGotoAction * actionGoto = static_cast<const PDFGotoAction*>(action);
         // TODO: Possibly handle other properties of destination() (e.g.,
         // viewport settings, zoom level, etc.)
-        emit requestOpenPdf(actionGoto->filename(), actionGoto->destination().page(), actionGoto->openInNewWindow());
+        // Note: if this action requires us to open other files (possible
+        // security issue) or to create a new window, we need to propagate this
+        // up the hierarchy. Otherwise we can handle it ourselves here.
+        if (actionGoto->isRemote() || actionGoto->openInNewWindow())
+          emit requestOpenPdf(actionGoto->filename(), actionGoto->destination().page(), actionGoto->openInNewWindow());
+        else
+          goToPage(actionGoto->destination().page());
       }
       break;
     case PDFAction::ActionTypeURI:
@@ -1528,6 +1563,307 @@ void PDFLinkGraphicsItem::mouseReleaseEvent(QGraphicsSceneMouseEvent *event)
   if (_link && _link->actionOnActivation())
     QCoreApplication::postEvent(scene(), new PDFActionEvent(_link->actionOnActivation()));
   _activated = false;
+}
+
+
+// PDFToCDockWidget
+// ============
+
+PDFToCDockWidget::PDFToCDockWidget(QWidget * parent) :
+  QDockWidget(PDFDocumentView::trUtf8("Table of Contents"), parent)
+{
+  QTreeWidget * tree = new QTreeWidget(this);
+  tree->setAlternatingRowColors(true);
+  tree->setHeaderHidden(true);
+  tree->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+  connect(tree, SIGNAL(itemSelectionChanged()), this, SLOT(itemSelectionChanged()));
+  setWidget(tree);
+}
+
+PDFToCDockWidget::~PDFToCDockWidget()
+{
+  clearTree();
+}
+  
+void PDFToCDockWidget::setToCData(const PDFToC data)
+{
+  QTreeWidget * tree = qobject_cast<QTreeWidget*>(widget());
+  if (!tree)
+    return;
+  clearTree();
+  recursiveAddTreeItems(data, tree->invisibleRootItem());
+}
+
+void PDFToCDockWidget::itemSelectionChanged()
+{
+  QTreeWidget * tree = qobject_cast<QTreeWidget*>(widget());
+  if (!tree || tree->selectedItems().isEmpty())
+    return;
+  
+  // Since the ToC QTreeWidget is in single selection mode, the first element is
+  // the only one.
+  QTreeWidgetItem * item = tree->selectedItems().first();
+  Q_ASSERT(item != NULL);
+  // TODO: It might be better to register PDFAction with the QMetaType framework
+  // instead of doing casts with (void*).
+  PDFAction * action = (PDFAction*)item->data(0, Qt::UserRole).value<void*>();
+  if (action)
+    emit actionTriggered(action);
+}
+
+void PDFToCDockWidget::clearTree()
+{
+  QTreeWidget * tree = qobject_cast<QTreeWidget*>(widget());
+  if (!tree)
+    return;
+
+  recursiveClearTreeItems(tree->invisibleRootItem());
+}
+
+//static
+void PDFToCDockWidget::recursiveAddTreeItems(const QList<PDFToCItem> & tocItems, QTreeWidgetItem * parentTreeItem)
+{
+  foreach (const PDFToCItem & tocItem, tocItems) {
+    QTreeWidgetItem * treeItem = new QTreeWidgetItem(parentTreeItem, QStringList(tocItem.label()));
+    treeItem->setForeground(0, tocItem.color());
+    if (tocItem.flags()) {
+      QFont font = treeItem->font(0);
+      font.setBold(tocItem.flags().testFlag(PDFToCItem::Flag_Bold));
+      font.setItalic(tocItem.flags().testFlag(PDFToCItem::Flag_Bold));
+      treeItem->setFont(0, font);
+    }
+    treeItem->setExpanded(tocItem.isOpen());
+    // TODO: It might be better to register PDFAction via QMetaType to avoid
+    // having to use (void*).
+    treeItem->setData(0, Qt::UserRole, QVariant::fromValue((void*)tocItem.action()->clone()));
+
+    // FIXME: page numbers in col 2, goto actions, etc.
+
+    if (!tocItem.children().isEmpty())
+      recursiveAddTreeItems(tocItem.children(), treeItem);
+  }
+}
+
+//static
+void PDFToCDockWidget::recursiveClearTreeItems(QTreeWidgetItem * parent)
+{
+  Q_ASSERT(parent != NULL);
+  while (parent->childCount() > 0) {
+    QTreeWidgetItem * item = parent->child(0);
+    recursiveClearTreeItems(item);
+    PDFAction * action = (PDFAction*)item->data(0, Qt::UserRole).value<void*>();
+    if (action)
+      delete action;
+    parent->removeChild(item);
+    delete item;
+  }
+}
+
+
+// PDFMetaDataDockWidget
+// ============
+PDFMetaDataDockWidget::PDFMetaDataDockWidget(QWidget * parent) : 
+  QDockWidget(PDFDocumentView::trUtf8("Meta Data"), parent)
+{
+  // scrollArea ... the central widget of the QDockWidget
+  // w ... the central widget of scrollArea
+  // groupBox ... one (of many) group box in w
+  // vLayout ... lays out the group boxes in w
+  // layout ... lays out the actual data widgets in groupBox
+  QScrollArea * scrollArea = new QScrollArea(this);
+  scrollArea->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+  QWidget * w = new QWidget(scrollArea);
+  QVBoxLayout * vLayout = new QVBoxLayout(w);
+  QGroupBox * groupBox;
+  QFormLayout * layout;
+
+  // We want the vLayout to set the size of w (which should encompass all child
+  // widgets completely, since we in turn put it into scrollArea to handle
+  // oversized children
+  vLayout->setSizeConstraint(QLayout::SetFixedSize);
+  // Set margins to 0 as space is very limited in the sidebar
+  vLayout->setContentsMargins(0, 0, 0, 0);
+
+  // The "Document" group box
+  groupBox = new QGroupBox(PDFDocumentView::trUtf8("Document"), w);
+  layout = new QFormLayout(groupBox);
+
+  _title = new QLabel(groupBox);
+  _title->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+  layout->addRow(PDFDocumentView::trUtf8("Title:"), _title);
+
+  _author = new QLabel(groupBox);
+  _author->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+  layout->addRow(PDFDocumentView::trUtf8("Author:"), _author);
+
+  _subject = new QLabel(groupBox);
+  _subject->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+  layout->addRow(PDFDocumentView::trUtf8("Subject:"), _subject);
+
+  _keywords = new QLabel(groupBox);
+  _keywords->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+  layout->addRow(PDFDocumentView::trUtf8("Keywords:"), _keywords);
+
+  groupBox->setLayout(layout);
+  vLayout->addWidget(groupBox);
+
+  // The "Processing" group box
+  groupBox = new QGroupBox(PDFDocumentView::trUtf8("Processing"), w);
+  layout = new QFormLayout(groupBox);
+
+  _creator = new QLabel(groupBox);
+  _creator->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+  layout->addRow(PDFDocumentView::trUtf8("Creator:"), _creator);
+
+  _producer = new QLabel(groupBox);
+  _producer->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+  layout->addRow(PDFDocumentView::trUtf8("Producer:"), _producer);
+
+  _creationDate = new QLabel(groupBox);
+  _creationDate->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+  layout->addRow(PDFDocumentView::trUtf8("Creation date:"), _creationDate);
+
+  _modDate = new QLabel(groupBox);
+  _modDate->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+  layout->addRow(PDFDocumentView::trUtf8("Modification date:"), _modDate);
+
+  _trapped = new QLabel(groupBox);
+  _trapped->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+  layout->addRow(PDFDocumentView::trUtf8("Trapped:"), _trapped);
+
+  groupBox->setLayout(layout);
+  vLayout->addWidget(groupBox);
+
+  // The "Other" group box
+  _other = groupBox = new QGroupBox(PDFDocumentView::trUtf8("Other"), w);
+  layout = new QFormLayout(groupBox);
+
+  // Note: Items are added to the "Other" box dynamically in
+  // setMetaDataFromDocument()
+
+  groupBox->setLayout(layout);
+  vLayout->addWidget(groupBox);
+
+
+  w->setLayout(vLayout);
+  scrollArea->setWidget(w);
+  setWidget(scrollArea);
+}
+
+void PDFMetaDataDockWidget::setMetaDataFromDocument(const QSharedPointer<Document> doc)
+{
+  if (!doc)
+    return;
+  _title->setText(doc->title());
+  _author->setText(doc->author());
+  _subject->setText(doc->subject());
+  _keywords->setText(doc->keywords());
+  _creator->setText(doc->creator());
+  _producer->setText(doc->producer());
+  _creationDate->setText(doc->creationDate().toString(Qt::DefaultLocaleLongDate));
+  _modDate->setText(doc->modDate().toString(Qt::DefaultLocaleLongDate));
+  switch (doc->trapped()) {
+    case Document::Trapped_True:
+      _trapped->setText(PDFDocumentView::trUtf8("Yes"));
+      break;
+    case Document::Trapped_False:
+      _trapped->setText(PDFDocumentView::trUtf8("No"));
+      break;
+    default:
+      _trapped->setText(PDFDocumentView::trUtf8("Unknown"));
+      break;
+  }
+  QFormLayout * layout = qobject_cast<QFormLayout*>(_other->layout());
+  if (layout) {
+    // Remove any items there may be
+    while (layout->count() > 0) {
+      QLayoutItem * child = layout->takeAt(0);
+      if (child)
+        delete child;
+    }
+    QMap<QString, QString>::const_iterator it;
+    for (it = doc->metaDataOther().constBegin(); it != doc->metaDataOther().constEnd(); ++it) {
+      QLabel * l = new QLabel(it.value(), _other);
+      l->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+      layout->addRow(it.key(), l);
+    }
+  }
+}
+
+// PDFFontsDockWidget
+// ============
+PDFFontsDockWidget::PDFFontsDockWidget(QWidget * parent) :
+  QDockWidget(PDFDocumentView::trUtf8("Fonts"), parent)
+{
+  _table = new QTableWidget(this);
+
+#ifdef Q_WS_MAC /* don't do this on windows, as the font ends up too small */
+  QFont f(_table->font());
+  f.setPointSize(f.pointSize() - 2);
+  _table->setFont(f);
+#endif
+  _table->setColumnCount(4);
+  _table->setHorizontalHeaderLabels(QStringList() << PDFDocumentView::trUtf8("Name") << PDFDocumentView::trUtf8("Type") << PDFDocumentView::trUtf8("Subset") << PDFDocumentView::trUtf8("Source"));
+  _table->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+  _table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  _table->setAlternatingRowColors(true);
+  _table->setShowGrid(false);
+  _table->setSelectionBehavior(QAbstractItemView::SelectRows);
+  _table->verticalHeader()->hide();
+  _table->horizontalHeader()->setStretchLastSection(true);
+  _table->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft);
+
+  setWidget(_table);
+}
+
+void PDFFontsDockWidget::setFontsDataFromDocument(const QSharedPointer<Document> doc)
+{
+  Q_ASSERT(_table != NULL);
+
+  _table->clearContents();
+  if (!doc)
+    return;
+
+  QList<PDFFontInfo> fonts = doc->fonts();
+  _table->setRowCount(fonts.count());
+
+  int i = 0;
+  foreach (PDFFontInfo font, fonts) {
+    _table->setItem(i, 0, new QTableWidgetItem(font.descriptor().pureName()));
+    switch (font.fontType()) {
+      case PDFFontInfo::FontType_Type0:
+        _table->setItem(i, 1, new QTableWidgetItem(PDFDocumentView::trUtf8("Type 0")));
+        break;
+      case PDFFontInfo::FontType_Type1:
+        _table->setItem(i, 1, new QTableWidgetItem(PDFDocumentView::trUtf8("Type 1")));
+        break;
+      case PDFFontInfo::FontType_MMType1:
+        _table->setItem(i, 1, new QTableWidgetItem(PDFDocumentView::trUtf8("Type 1 (multiple master)")));
+        break;
+      case PDFFontInfo::FontType_Type3:
+        _table->setItem(i, 1, new QTableWidgetItem(PDFDocumentView::trUtf8("Type 3")));
+        break;
+      case PDFFontInfo::FontType_TrueType:
+        _table->setItem(i, 1, new QTableWidgetItem(PDFDocumentView::trUtf8("TrueType")));
+        break;
+    }
+    _table->setItem(i, 2, new QTableWidgetItem(font.isSubset() ? PDFDocumentView::trUtf8("yes") : PDFDocumentView::trUtf8("no")));
+    switch (font.source()) {
+      case PDFFontInfo::Source_Embedded:
+        _table->setItem(i, 3, new QTableWidgetItem(PDFDocumentView::trUtf8("[embedded]")));
+        break;
+      case PDFFontInfo::Source_Builtin:
+        _table->setItem(i, 3, new QTableWidgetItem(PDFDocumentView::trUtf8("[builtin]")));
+        break;
+      case PDFFontInfo::Source_File:
+        _table->setItem(i, 3, new QTableWidgetItem(font.fileName().canonicalFilePath()));
+        break;
+    }
+    ++i;
+  }
+  _table->resizeColumnsToContents();
+  _table->resizeRowsToContents();
+  _table->sortItems(0);
 }
 
 

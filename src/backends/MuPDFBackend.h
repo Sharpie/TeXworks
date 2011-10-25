@@ -41,12 +41,14 @@ protected:
   pdf_xref *_mupdf_data;
   fz_glyph_cache *_glyph_cache;
 
+  void loadMetaData();
+
 public:
   MuPDFDocument(QString fileName);
   ~MuPDFDocument();
 
   Page *page(int at);
-
+  QList<PDFFontInfo> fonts() const;
 };
 
 
