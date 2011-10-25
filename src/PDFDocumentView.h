@@ -24,6 +24,9 @@ class PDFPageGraphicsItem;
 class PDFLinkGraphicsItem;
 class PDFDocumentMagnifierView;
 class PDFActionEvent;
+class PDFToCDockWidget;
+class PDFMetaDataDockWidget;
+class PDFFontsDockWidget;
 
 const int TILE_SIZE=1024;
 
@@ -53,6 +56,14 @@ public:
   int lastPage();
   PageMode pageMode() const { return _pageMode; }
   qreal zoomLevel() const { return _zoomLevel; }
+
+  // The ownership of the returned pointers is transferred to the caller (i.e.,
+  // he has to destroy them, unless the `parent` widget does that automatically)
+  // They are fully wired to this PDFDocumentView (e.g., clicking on entries in
+  // the table of contents will change this view)
+  QDockWidget * tocDockWidget(QWidget * parent);
+  QDockWidget * metaDataDockWidget(QWidget * parent);
+  QDockWidget * fontsDockWidget(QWidget * parent);
 
 public slots:
   void goPrev();
@@ -162,6 +173,57 @@ protected:
   QPixmap _dropShadow;
 };
 
+class PDFToCDockWidget : public QDockWidget
+{
+  Q_OBJECT
+public:
+  PDFToCDockWidget(QWidget * parent);
+  virtual ~PDFToCDockWidget();
+  
+  void setToCData(const PDFToC data);
+signals:
+  void actionTriggered(const PDFAction*);
+private slots:
+  void itemSelectionChanged();
+private:
+  void clearTree();
+  static void recursiveAddTreeItems(const QList<PDFToCItem> & tocItems, QTreeWidgetItem * parentTreeItem);
+  static void recursiveClearTreeItems(QTreeWidgetItem * parent);
+};
+
+class PDFMetaDataDockWidget : public QDockWidget
+{
+  Q_OBJECT
+public:
+  PDFMetaDataDockWidget(QWidget * parent);
+  virtual ~PDFMetaDataDockWidget() { }
+  
+  void setMetaDataFromDocument(const QSharedPointer<Document> doc);
+private:
+  QLabel * _title;
+  QLabel * _author;
+  QLabel * _subject;
+  QLabel * _keywords;
+  QLabel * _creator;
+  QLabel * _producer;
+  QLabel * _creationDate;
+  QLabel * _modDate;
+  QLabel * _trapped;
+  QGroupBox * _other;
+};
+
+class PDFFontsDockWidget : public QDockWidget
+{
+  Q_OBJECT
+public:
+  PDFFontsDockWidget(QWidget * parent);
+  virtual ~PDFFontsDockWidget() { }
+  
+  void setFontsDataFromDocument(const QSharedPointer<Document> doc);
+private:
+  QTableWidget * _table;
+};
+
 // Cannot use QGraphicsGridLayout and similar classes for pages because it only
 // works for QGraphicsLayoutItem (i.e., QGraphicsWidget)
 class PDFPageLayout : public QObject {
@@ -240,6 +302,8 @@ public:
   void showAllPages() const;
 
   int lastPage();
+
+  const QSharedPointer<Document> document() const { return _doc; }
 
 signals:
   void pageChangeRequested(int pageNum);
