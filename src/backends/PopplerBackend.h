@@ -44,7 +44,7 @@ public:
   PopplerDocument(QString fileName);
   ~PopplerDocument();
 
-  Page *page(int at);
+  QSharedPointer<Page> page(int at);
   PDFDestination resolveDestination(const PDFDestination & namedDestination) const;
 
   PDFToC toc() const;
@@ -68,6 +68,8 @@ public:
   QImage renderToImage(double xres, double yres, QRect render_box = QRect(), bool cache = false);
 
   QList< QSharedPointer<PDFLinkAnnotation> > loadLinks();
+
+  QList<SearchResult> search(QString searchText);
 };
 
 

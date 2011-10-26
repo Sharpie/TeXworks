@@ -44,6 +44,10 @@ class PDFDocumentView : public QGraphicsView {
   qreal _zoomLevel;
   int _currentPage, _lastPage;
 
+  QString _searchString;
+  QList<QGraphicsItem *> _searchResults;
+  int _currentSearchResult;
+
 public:
   enum PageMode { PageMode_SinglePage, PageMode_OneColumnContinuous, PageMode_TwoColumnContinuous };
   enum MouseMode { MouseMode_MagnifyingGlass, MouseMode_Move, MouseMode_MarqueeZoom };
@@ -88,6 +92,11 @@ public slots:
   void zoomToRect(QRectF a_rect);
   void zoomFitWindow();
   void zoomFitWidth();
+
+  void search(QString searchText);
+  void nextSearchResult();
+  void previousSearchResult();
+  void clearSearchResults();
 
 signals:
   void changedPage(int pageNum);
@@ -294,6 +303,7 @@ class PDFDocumentScene : public QGraphicsScene
 public:
   PDFDocumentScene(Document *a_doc, QObject *parent = 0);
 
+  QSharedPointer<Document> document();
   QList<QGraphicsItem*> pages();
   QList<QGraphicsItem*> pages(const QPolygonF &polygon);
   QGraphicsItem* pageAt(const int idx);
@@ -313,11 +323,11 @@ signals:
   void pageLayoutChanged();
   void pdfActionTriggered(const PDFAction * action);
 
-protected:
-  bool event(QEvent* event);
-
 protected slots:
   void pageLayoutChanged(const QRectF& sceneRect);
+
+protected:
+  bool event(QEvent* event);
 
 private:
   // Parent has no copy constructor, so this class shouldn't either. Also, we
@@ -344,7 +354,7 @@ class PDFPageGraphicsItem : public QGraphicsObject
 
   bool _linksLoaded;
 
-  QTransform _pageScale;
+  QTransform _pageScale, _pointScale;
   qreal _zoomLevel, _magnifiedZoomLevel;
 
   int _nTile_x, _nTile_y;
@@ -355,7 +365,7 @@ class PDFPageGraphicsItem : public QGraphicsObject
 
 public:
 
-  PDFPageGraphicsItem(Page *a_page, QGraphicsItem *parent = 0);
+  PDFPageGraphicsItem(QSharedPointer<Page> a_page, QGraphicsItem *parent = 0);
 
   // This seems fragile as it assumes no other code declaring a custom graphics
   // item will choose the same ID for it's object types. Unfortunately, there
@@ -378,6 +388,9 @@ public:
   // coordinate system (in pt) - chain with mapFromScene and related methods to
   // convert from coordinates in other systems
   QPointF mapToPage(const QPointF & point) const;
+
+  QTransform pageScale() { return _pageScale; }
+  QTransform pointScale() { return _pointScale; }
 
 protected:
   bool event(QEvent *event);

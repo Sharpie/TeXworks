@@ -45,7 +45,19 @@ MuPDFDocument::~MuPDFDocument()
   fz_free_glyph_cache(_glyph_cache);
 }
 
-Page *MuPDFDocument::page(int at){ return new MuPDFPage(this, at); }
+QSharedPointer<Page> MuPDFDocument::page(int at)
+{
+  // FIXME: Come up with something to deal with a zero-page PDF.
+  assert(_numPages != 0);
+
+  if( _pages.isEmpty() )
+    _pages.resize(_numPages);
+
+  if( _pages[at].isNull() )
+    _pages[at] = QSharedPointer<Page>(new MuPDFPage(this, at));
+
+  return QSharedPointer<Page>(_pages[at]);
+}
 
 void MuPDFDocument::loadMetaData()
 {
@@ -335,6 +347,14 @@ QList< QSharedPointer<PDFLinkAnnotation> > MuPDFPage::loadLinks()
 {
   // FIXME: This always returns an empty list. Needs a proper implementation.
   return _links;
+}
+
+QList<SearchResult> MuPDFPage::search(QString searchText)
+{
+  // FIXME: Currently unimplemented and always returns an empty list.
+  QList<SearchResult> results;
+
+  return results;
 }
 
 

@@ -13,6 +13,34 @@ private slots:
 };
 
 
+class SearchLineEdit : public QLineEdit
+{
+  Q_OBJECT
+
+public:
+  SearchLineEdit(QWidget *parent = 0);
+
+protected:
+  void resizeEvent(QResizeEvent *);
+
+private:
+  QToolButton *nextResultButton, *previousResultButton, *clearButton;
+
+signals:
+  void searchRequested(QString searchText);
+  void gotoNextResult();
+  void gotoPreviousResult();
+  void searchCleared();
+
+private slots:
+  void prepareSearch();
+  void clearSearch();
+  void handleNextResult();
+  void handlePreviousResult();
+
+};
+
+
 class PageCounter : public QLabel {
   Q_OBJECT
   typedef QLabel super;

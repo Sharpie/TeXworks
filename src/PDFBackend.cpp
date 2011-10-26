@@ -120,7 +120,7 @@ QRectF PDFDestination::viewport(const Document * doc, const QRectF oldViewport, 
     {
       if (!doc)
         break;
-      Page * p = const_cast<Document*>(doc)->page(_page);
+      QSharedPointer<Page> p(const_cast<Document*>(doc)->page(_page));
       if (!p)
         break;
       retVal = QRectF(QPointF(0, 0), p->pageSizeF());
@@ -131,7 +131,7 @@ QRectF PDFDestination::viewport(const Document * doc, const QRectF oldViewport, 
     {
       if (!doc)
         break;
-      Page * p = const_cast<Document*>(doc)->page(_page);
+      QSharedPointer<Page> p(const_cast<Document*>(doc)->page(_page));
       if (!p)
         break;
       float aspectRatio = oldViewport.width() / oldViewport.height();
@@ -143,7 +143,7 @@ QRectF PDFDestination::viewport(const Document * doc, const QRectF oldViewport, 
     {
       if (!doc)
         break;
-      Page * p = const_cast<Document*>(doc)->page(_page);
+      QSharedPointer<Page> p(const_cast<Document*>(doc)->page(_page));
       if (!p)
         break;
       float aspectRatio = oldViewport.width() / oldViewport.height();
@@ -527,6 +527,20 @@ Document::~Document()
 int Document::numPages() { return _numPages; }
 PDFPageProcessingThread &Document::processingThread() { return _processingThread; }
 PDFPageCache &Document::pageCache() { return _pageCache; }
+
+QList<SearchResult> Document::search(QString searchText, int startPage)
+{
+  QList<SearchResult> results;
+  int i;
+
+  for (i = startPage; i < _numPages; ++i)
+    results << page(i)->search(searchText);
+  for (i = 0; i < startPage; ++i)
+    results << page(i)->search(searchText);
+
+
+  return results;
+}
 
 
 // Page Class

@@ -607,6 +607,13 @@ protected:
 
 typedef QList<PDFToCItem> PDFToC;
 
+struct  SearchResult
+{
+  int pageNum;
+  QRectF bbox;
+};
+
+
 // PDF ABCs
 // ========
 // This header file defines a set of Abstract Base Classes (ABCs) for PDF
@@ -628,7 +635,7 @@ public:
   PDFPageProcessingThread& processingThread();
   PDFPageCache& pageCache();
 
-  virtual Page *page(int at)=0;
+  virtual QSharedPointer<Page> page(int at) = 0;
   virtual PDFDestination resolveDestination(const PDFDestination & namedDestination) const {
     return (namedDestination.isExplicit() ? namedDestination : PDFDestination());
   }
@@ -651,10 +658,22 @@ public:
   QMap<QString, QString> metaDataOther() const { return _meta_other; }
   // </metadata>
 
+  // Searches the entire document for the given string and returns a list of
+  // boxes that contain that text.
+  //
+  // TODO:
+  //
+  //   - Implement as a function that returns a generator object which can
+  //     return the search results one at a time rather than all at once.
+  //
+  //   - See TODO list in `Page::search`
+  virtual QList<SearchResult> search(QString searchText, int startPage=0);
+
 protected:
   int _numPages;
   PDFPageProcessingThread _processingThread;
   PDFPageCache _pageCache;
+  QVector< QSharedPointer<Page> > _pages;
 
   QString _meta_title;
   QString _meta_author;
@@ -681,7 +700,7 @@ public:
 
   int pageNum();
   virtual QSizeF pageSizeF()=0;
-  
+
   Document * document() { return _parent; }
 
   virtual QImage renderToImage(double xres, double yres, QRect render_box = QRect(), bool cache = false)=0;
@@ -698,6 +717,22 @@ public:
   // requests). Otherwise, the method renders the page synchronously and returns
   // the result.
   QSharedPointer<QImage> getTileImage(QObject * listener, const double xres, const double yres, QRect render_box = QRect());
+
+
+  // Searches the page for the given text string and returns a list of boxes
+  // that contain that text.
+  //
+  // TODO:
+  //
+  // Implement as a function that returns a generator object which can return
+  // the search results one at a time rather than all at once which is time
+  // consuming. Even better, allow the returned object to be used as a C++
+  // iterator---then we could pass it off to QtConcurrent to generate results
+  // in the background and access them through a QFuture.
+  //
+  // This is very tricky to do in C++. God I miss Python and its `itertools`
+  // library.
+  virtual QList<SearchResult> search(QString searchText) = 0;
 };
 
 

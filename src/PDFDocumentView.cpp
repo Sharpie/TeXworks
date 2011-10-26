@@ -29,6 +29,7 @@ static bool isPageItem(QGraphicsItem *item) { return ( item->type() == PDFPageGr
 // and displaying the contents of a `Document` using a `QGraphicsScene`.
 PDFDocumentView::PDFDocumentView(QWidget *parent):
   Super(parent),
+  _pdf_scene(NULL),
   _rubberBandOrigin(),
   _zoomLevel(1.0),
   _pageMode(PageMode_OneColumnContinuous),
@@ -61,6 +62,10 @@ void PDFDocumentView::setScene(PDFDocumentScene *a_scene)
 
   _pdf_scene = a_scene;
   _lastPage = a_scene->lastPage();
+
+  // Ensure search result list is empty in case we are switching from another
+  // scene.
+  _searchResults.clear();
 
   // Respond to page jumps requested by the `PDFDocumentScene`.
   //
@@ -325,6 +330,92 @@ void PDFDocumentView::setMagnifierSize(const int size)
   if (_magnifier)
     _magnifier->setSize(size);
 }
+
+void PDFDocumentView::search(QString searchText)
+{
+  if ( not _pdf_scene )
+    return;
+
+  if ( searchText != _searchString ) {
+    clearSearchResults();
+
+#ifdef DEBUG
+    // Test search.
+    qDebug() << "Searching for: " << searchText;
+    stopwatch.start();
+#endif
+    QList<SearchResult> results = _pdf_scene->document()->search(searchText, _currentPage);
+#ifdef DEBUG
+    qDebug() << "Document has : " << results.size() << " occurances of the search string. Search took: " << stopwatch.elapsed() << " milliseconds";
+#endif
+
+    // FIXME:
+    // The brush used for highlighting should be defined at global scope to
+    // remove the need for re-creating it on each function call. Should also be
+    // configurable via a settings object.
+    QColor fillColor(Qt::yellow);
+    fillColor.setAlphaF(0.6);
+    QBrush highlightBrush(fillColor);
+
+    foreach( SearchResult result, results ) {
+      PDFPageGraphicsItem *page = qgraphicsitem_cast<PDFPageGraphicsItem*>(_pdf_scene->pageAt(result.pageNum));
+
+      // This causes the page to take ownership of the highlight item which applies
+      // necessary transformations and adds the item to the scene.
+      QGraphicsRectItem *highlightItem = new QGraphicsRectItem(result.bbox, page);
+
+      highlightItem->setBrush(highlightBrush);
+      highlightItem->setPen(Qt::NoPen);
+      highlightItem->setTransform(page->pointScale());
+
+      _searchResults << highlightItem;
+    }
+
+    _searchString = searchText;
+    _currentSearchResult = 0;
+  }
+
+  // Center view on first search result.
+  nextSearchResult();
+}
+
+void PDFDocumentView::nextSearchResult()
+{
+  if ( not _pdf_scene || _searchResults.empty() )
+    return;
+
+  if ( (_currentSearchResult + 1) >= _searchResults.size() )
+    _currentSearchResult = 0;
+  else
+    ++_currentSearchResult;
+
+  centerOn(_searchResults[_currentSearchResult]);
+}
+
+void PDFDocumentView::previousSearchResult()
+{
+  if ( not _pdf_scene || _searchResults.empty() )
+    return;
+
+  if ( (_currentSearchResult - 1) < 0 )
+    _currentSearchResult = _searchResults.size() - 1;
+  else
+    --_currentSearchResult;
+
+  centerOn(_searchResults[_currentSearchResult]);
+}
+
+void PDFDocumentView::clearSearchResults()
+{
+  if ( not _pdf_scene || _searchResults.empty() )
+    return;
+
+  foreach( QGraphicsItem *item, _searchResults )
+    _pdf_scene->removeItem(item);
+
+  _searchResults.clear();
+}
+
 
 // Protected Slots
 // --------------
@@ -1202,6 +1293,7 @@ void PDFDocumentScene::handleActionEvent(const PDFActionEvent * action_event)
 // Accessors
 // ---------
 
+QSharedPointer<Document> PDFDocumentScene::document() { return QSharedPointer<Document>(_doc); }
 QList<QGraphicsItem*> PDFDocumentScene::pages() { return _pages; };
 
 // Overloaded method that returns all page objects inside a given rectangular
@@ -1264,6 +1356,7 @@ bool PDFDocumentScene::event(QEvent *event)
   return Super::event(event);
 }
 
+
 // Protected Slots
 // --------------
 void PDFDocumentScene::pageLayoutChanged(const QRectF& sceneRect)
@@ -1302,7 +1395,7 @@ void PDFDocumentScene::showAllPages() const
 
 // This class descends from `QGraphicsObject` and implements the on-screen
 // representation of `Page` objects.
-PDFPageGraphicsItem::PDFPageGraphicsItem(Page *a_page, QGraphicsItem *parent):
+PDFPageGraphicsItem::PDFPageGraphicsItem(QSharedPointer<Page> a_page, QGraphicsItem *parent):
   Super(parent),
   _page(a_page),
   _dpiX(QApplication::desktop()->physicalDpiX()),
@@ -1319,7 +1412,12 @@ PDFPageGraphicsItem::PDFPageGraphicsItem(Page *a_page, QGraphicsItem *parent):
   _pageSize.setWidth(_pageSize.width() * _dpiX / 72.0);
   _pageSize.setHeight(_pageSize.height() * _dpiY / 72.0);
 
+  // `_pageScale` holds a transformation matrix that can map between normalized
+  // page coordinates (in the range 0...1) and the coordinate system for this
+  // graphics item. `_pointScale` is similar, except it maps from coordinates
+  // expressed in pixels at a resolution of 72 dpi.
   _pageScale = QTransform::fromScale(_pageSize.width(), _pageSize.height());
+  _pointScale = QTransform::fromScale(_dpiX / 72.0, _dpiY / 72.0);
 
   // So we get information during paint events about what portion of the page
   // is visible.

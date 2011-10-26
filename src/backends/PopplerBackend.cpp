@@ -141,7 +141,19 @@ PopplerDocument::~PopplerDocument()
 {
 }
 
-Page *PopplerDocument::page(int at){ return new PopplerPage(this, at); }
+QSharedPointer<Page> PopplerDocument::page(int at)
+{
+  // FIXME: Come up with something to deal with a zero-page PDF.
+  Q_ASSERT(_numPages != 0);
+
+  if( _pages.isEmpty() )
+    _pages.resize(_numPages);
+
+  if( _pages[at].isNull() )
+    _pages[at] = QSharedPointer<Page>(new PopplerPage(this, at));
+
+  return QSharedPointer<Page>(_pages[at]);
+}
 
 PDFDestination PopplerDocument::resolveDestination(const PDFDestination & namedDestination) const
 {
@@ -388,7 +400,7 @@ QList< QSharedPointer<PDFLinkAnnotation> > PopplerPage::loadLinks()
         continue;
     }
 
-    
+
     // Look up the corresponding Poppler::LinkAnnotation object
     // Note: Poppler::LinkAnnotation::linkDestionation() [sic] doesn't reliably
     // return a Poppler::Link*. Therefore, we have to find the correct
@@ -415,6 +427,33 @@ QList< QSharedPointer<PDFLinkAnnotation> > PopplerPage::loadLinks()
     _links << link;
   }
   return _links;
+}
+
+QList<SearchResult> PopplerPage::search(QString searchText)
+{
+  QList<SearchResult> results;
+  SearchResult result;
+  double left, right, top, bottom;
+
+  result.pageNum = _n;
+
+  QMutexLocker docLock(static_cast<PopplerDocument *>(_parent)->_doc_lock);
+    // The Poppler search function that takes a QRectF has been marked as
+    // depreciated---something to do with float <-> double conversion causing
+    // infinite loops on some architectures. So, we explicitly use doubles and
+    // avoid the depreciated function.
+    if ( _poppler_page->search(searchText, left, top, right, bottom, Poppler::Page::FromTop, Poppler::Page::CaseInsensitive) ) {
+      result.bbox = QRectF(qreal(left), qreal(top), qAbs(qreal(right) - qreal(left)), qAbs(qreal(bottom) - qreal(top)));
+      results << result;
+    }
+
+    while ( _poppler_page->search(searchText, left, top, right, bottom, Poppler::Page::NextResult, Poppler::Page::CaseInsensitive) ) {
+      result.bbox = QRectF(qreal(left), qreal(top), qAbs(qreal(right) - qreal(left)), qAbs(qreal(bottom) - qreal(top)));
+      results << result;
+    }
+  docLock.unlock();
+
+  return results;
 }
 
 
