@@ -194,6 +194,12 @@ void PDFDocumentView::goToPage(int pageNum, bool centerOnTop /* = true */)
 
     // **TODO:** Investigate why this approach doesn't work during startup if
     // the margin is set to 0
+    // FIXME: ensureVisible only does what the name suggests: it ensures that
+    // the given point is visible. This means that centerOnTop does not do what
+    // it suggests if we come from above, as ensureVisible will only move the
+    // top left corner of the page into view, i.e., to the bottom border. To
+    // test, see comment in pdfActionTriggered(). Possibly use
+    // goToPage(PDFPageGraphicsItem*, QRectF, bool) entirely?
     if (centerOnTop)
       ensureVisible(pageRect.left(), pageRect.top(), 1, 1);
     else
@@ -423,6 +429,33 @@ void PDFDocumentView::maybeUpdateSceneRect() {
   setSceneRect(_pdf_scene->pageAt(_currentPage)->sceneBoundingRect());
 }
 
+void PDFDocumentView::goToPage(const PDFPageGraphicsItem * page, const QRectF view, const bool mayZoom /* = false */)
+{
+  if (!page || page->page().isNull())
+    return;
+
+  // We must check if rect is valid, not view, as the latter usually has
+  // negative height due to the inverted pdf coordinate system (y axis is up,
+  // not down)
+  QRectF rect(page->mapRectToScene(QRectF(page->mapFromPage(view.topLeft()), \
+                                          page->mapFromPage(view.bottomRight()))));
+  if (!rect.isValid())
+    return;
+
+  if (mayZoom) {
+    fitInView(rect, Qt::KeepAspectRatio);
+    _zoomLevel = transform().m11();
+    emit changedZoom(_zoomLevel);
+  }
+  else
+    centerOn(rect.center());
+
+  if (_currentPage != page->page()->pageNum()) {
+    _currentPage = page->page()->pageNum();
+    emit changedPage(_currentPage);
+  }
+}
+
 void PDFDocumentView::pdfActionTriggered(const PDFAction * action)
 {
   if (!action)
@@ -441,8 +474,30 @@ void PDFDocumentView::pdfActionTriggered(const PDFAction * action)
         // up the hierarchy. Otherwise we can handle it ourselves here.
         if (actionGoto->isRemote() || actionGoto->openInNewWindow())
           emit requestOpenPdf(actionGoto->filename(), actionGoto->destination().page(), actionGoto->openInNewWindow());
-        else
-          goToPage(actionGoto->destination().page());
+        else {
+          Q_ASSERT(_pdf_scene != NULL);
+          Q_ASSERT(!_pdf_scene->document().isNull());
+          Q_ASSERT(isPageItem(_pdf_scene->pageAt(_currentPage)));
+          PDFPageGraphicsItem * pageItem = static_cast<PDFPageGraphicsItem*>(_pdf_scene->pageAt(_currentPage));
+          Q_ASSERT(pageItem != NULL);
+          
+          PDFDestination dest = _pdf_scene->document()->resolveDestination(actionGoto->destination());
+          if (!dest.isValid() || !dest.isExplicit())
+            break;
+
+          // Get the current (=old) viewport in the current (=old) page's
+          // coordinate system
+          QRectF oldViewport = pageItem->mapRectFromScene(mapToScene(viewport()->rect()).boundingRect());
+          oldViewport = QRectF(pageItem->mapToPage(oldViewport.topLeft()), \
+                               pageItem->mapToPage(oldViewport.bottomRight()));
+          // Calculate the new viewport (in page coordinates)
+          QRectF view(dest.viewport(_pdf_scene->document().data(), oldViewport, _zoomLevel));
+
+          // FIXME: Activate the following line to debug the centerOnTop
+          // behavior of goToPage(int, bool)
+//          goToPage(dest.page());
+          goToPage(static_cast<PDFPageGraphicsItem*>(_pdf_scene->pageAt(dest.page())), view, true);
+        }
       }
       break;
     case PDFAction::ActionTypeURI:
@@ -1205,23 +1260,10 @@ void PDFDocumentScene::handleActionEvent(const PDFActionEvent * action_event)
 
   switch (action_event->action->type() )
   {
-    case PDFAction::ActionTypeGoTo:
-      {
-        const PDFGotoAction * actionGoto = static_cast<const PDFGotoAction*>(action);
-        if (!actionGoto->isRemote()) {
-          // Jump by page number.
-          //
-          // **NOTE:**
-          // _There are many details that are not being considered, such as
-          // centering on a specific anchor point and possibly changing the zoom
-          // level rather than just focusing on the center of the target page._
-          emit pageChangeRequested(actionGoto->destination().page());
-          return;
-        }
-      }
-      break;
     // Link types that we don't handle here but that may be of interest
-    // elsewhere
+    // elsewhere (note: ActionGoto will be handled by
+    // PDFDocumentView::pdfActionTriggered)
+    case PDFAction::ActionTypeGoTo:
     case PDFAction::ActionTypeURI:
     case PDFAction::ActionTypeLaunch:
       break;
@@ -1374,14 +1416,14 @@ PDFPageGraphicsItem::PDFPageGraphicsItem(QSharedPointer<Page> a_page, QGraphicsI
 QRectF PDFPageGraphicsItem::boundingRect() const { return QRectF(QPointF(0.0, 0.0), _pageSize); }
 int PDFPageGraphicsItem::type() const { return Type; }
 
-QPointF PDFPageGraphicsItem::mapFromPage(const QPointF & point)
+QPointF PDFPageGraphicsItem::mapFromPage(const QPointF & point) const
 {
   // item coordinates are in pixels
   return QPointF(_pageSize.width() * point.x() / _page->pageSizeF().width(), \
     _pageSize.height() * (1.0 - point.y() / _page->pageSizeF().height()));
 }
 
-QPointF PDFPageGraphicsItem::mapToPage(const QPointF & point)
+QPointF PDFPageGraphicsItem::mapToPage(const QPointF & point) const
 {
   // item coordinates are in pixels
   return QPointF(_page->pageSizeF().width() * point.x() / _pageSize.width(), \
@@ -1561,6 +1603,9 @@ PDFLinkGraphicsItem::PDFLinkGraphicsItem(QSharedPointer<PDFLinkAnnotation> a_lin
   // The link area is expressed in "normalized page coordinates", i.e.  values
   // in the range [0, 1]. The transformation matrix of this item will have to
   // be adjusted so that links will show up correctly in a graphics view.
+  // FIXME: the link rectangle __should__ be given in pdf coordinates (as that
+  // is the fundamental, implementation-agnostic, standardized coordinate
+  // system)
   setRect(_link->rect());
 
   // Allows links to provide a context-specific cursor when the mouse is
@@ -1595,7 +1640,7 @@ PDFLinkGraphicsItem::PDFLinkGraphicsItem(QSharedPointer<PDFLinkAnnotation> a_lin
       case PDFAction::ActionTypeGoTo:
         {
           PDFGotoAction * actionGoto = static_cast<PDFGotoAction*>(action);
-          setToolTip(PDFDocumentView::trUtf8("<p>Goto page %1</p>").arg(actionGoto->destination().page()));
+          setToolTip(PDFDocumentView::trUtf8("<p>Goto page %1</p>").arg(actionGoto->destination().page() + 1));
         }
         break;
       case PDFAction::ActionTypeURI:
@@ -1733,7 +1778,8 @@ void PDFToCDockWidget::recursiveAddTreeItems(const QList<PDFToCItem> & tocItems,
     treeItem->setExpanded(tocItem.isOpen());
     // TODO: It might be better to register PDFAction via QMetaType to avoid
     // having to use (void*).
-    treeItem->setData(0, Qt::UserRole, QVariant::fromValue((void*)tocItem.action()->clone()));
+    if (tocItem.action())
+      treeItem->setData(0, Qt::UserRole, QVariant::fromValue((void*)tocItem.action()->clone()));
 
     // FIXME: page numbers in col 2, goto actions, etc.
 

@@ -35,6 +35,8 @@ class MuPDFDocument: public Document
   typedef Document Super;
   friend class MuPDFPage;
 
+  void recursiveConvertToC(QList<PDFToCItem> & items, pdf_outline * node) const;
+
 protected:
   // The pdf_xref is the main MuPDF object that represents a Document. Calls
   // that use it may have to be protected by a mutex.
@@ -48,6 +50,9 @@ public:
   ~MuPDFDocument();
 
   QSharedPointer<Page> page(int at);
+  PDFDestination resolveDestination(const PDFDestination & namedDestination) const;
+
+  PDFToC toc() const;
   QList<PDFFontInfo> fonts() const;
 };
 
