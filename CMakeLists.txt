@@ -107,6 +107,7 @@ ENDIF ()
 # Options controlling the creation of scripting language plugins.
 OPTION(WITH_LUA "Build TeXworks Lua plugin?" ON)
 OPTION(WITH_PYTHON "Build TeXworks Python plugin?" ON)
+OPTION(WITH_COFFEESCRIPT "Build TeXworks CoffeeScript plugin? (experimental)" OFF)
 
 # On OS X we default to linking against the Python libraries provided by Apple
 # even if other Pythons are available. This helps when building
@@ -246,6 +247,11 @@ IF ( PYTHONLIBS_FOUND )
   ADD_SUBDIRECTORY(${TeXworks_SOURCE_DIR}/plugins-src/TWPythonPlugin)
 ENDIF ()
 
+IF ( WITH_COFFEESCRIPT )
+  ADD_SUBDIRECTORY(${TeXworks_SOURCE_DIR}/plugins-src/TWCoffeeScriptPlugin)
+ENDIF ()
+
+
 
 # Packaging
 # =========
@@ -349,6 +355,7 @@ CONFIG_YESNO("Python scripting plugin" PYTHONLIBS_FOUND)
 IF( APPLE )
   CONFIG_YESNO("  OS X system python" USE_SYSTEM_PYTHON)
 ENDIF()
+CONFIG_YESNO("CoffeeScript scripting plugin" WITH_COFFEESCRIPT)
 MESSAGE("")
 
 MESSAGE("  TeXworks will be installed to:")

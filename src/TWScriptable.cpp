@@ -42,6 +42,7 @@
 #include <QtPlugin>
 Q_IMPORT_PLUGIN(TWLuaPlugin)
 Q_IMPORT_PLUGIN(TWPythonPlugin)
+Q_IMPORT_PLUGIN(TWCoffeeScriptPlugin)
 #endif
 
 static

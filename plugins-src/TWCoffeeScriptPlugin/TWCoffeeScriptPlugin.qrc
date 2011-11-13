@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/TWCoffeeScriptPlugin">
+    <file>coffee-script.js</file>
+  </qresource>
+</RCC>
