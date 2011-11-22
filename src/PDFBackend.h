@@ -14,12 +14,18 @@
 #ifndef PDFBackend_H
 #define PDFBackend_H
 
-// FIXME: Thin the header inclusion down.
-#include <QtCore>
+#include <PDFAnnotations.h>
+
 #include <QImage>
-#include <QApplication>
-#include <QFlags>
-#include <QColor>
+#include <QFileInfo>
+#include <QSharedPointer>
+#include <QThread>
+#include <QStack>
+#include <QCache>
+#include <QMutex>
+#include <QReadWriteLock>
+#include <QWaitCondition>
+#include <QEvent>
 
 
 // Backend Rendering
@@ -30,238 +36,6 @@ class Document;
 
 // TODO: Find a better place to put this
 QDateTime fromPDFDate(QString pdfDate);
-
-
-// FIXME: Annotations and Actions should probably be moved to separate files
-
-// ABC for annotations
-// Modelled after sec. 8.4.1 of the PDF 1.7 specifications
-class PDFAnnotation
-{
-public:
-  enum AnnotationFlag {
-    Annotation_Default = 0x0,
-    Annotation_Invisible = 0x1,
-    Annotation_Hidden = 0x2,
-    Annotation_Print = 0x4,
-    Annotation_NoZoom = 0x8,
-    Annotation_NoRotate = 0x10,
-    Annotation_NoView = 0x20,
-    Annotation_ReadOnly = 0x40,
-    Annotation_Locked = 0x80,
-    Annotation_ToggleNoView = 0x100,
-    Annotation_LockedContents = 0x200
-  };
-  Q_DECLARE_FLAGS(AnnotationFlags, AnnotationFlag)
-
-  enum AnnotationType {
-    AnnotationTypeText, AnnotationTypeLink, AnnotationTypeFreeText,
-    AnnotationTypeLine, AnnotationTypeSquare, AnnotationTypeCircle,
-    AnnotationTypePolygon, AnnotationTypePolyLine, AnnotationTypeHighlight,
-    AnnotationTypeUnderline, AnnotationTypeSquiggly, AnnotationTypeStrikeOut,
-    AnnotationTypeStamp, AnnotationTypeCaret, AnnotationTypeInk,
-    AnnotationTypePopup, AnnotationTypeFileAttachment, AnnotationTypeSound,
-    AnnotationTypeMovie, AnnotationTypeWidget, AnnotationTypeScreen,
-    AnnotationTypePrinterMark, AnnotationTypeTrapNet, AnnotationTypeWatermark,
-    AnnotationType3D
-  };
-  
-  PDFAnnotation() : _page(NULL) { }
-  virtual ~PDFAnnotation() { }
-
-  virtual AnnotationType type() const = 0;
-  
-  // Declare all the getter/setter methods virtual so derived classes can
-  // override them
-  virtual QRectF rect() const { return _rect; }
-  virtual QString contents() const { return _contents; }
-  virtual Page * page() const { return _page; }
-  virtual QString name() const { return _name; }
-  virtual QDateTime lastModified() const { return _lastModified; }
-  virtual QFlags<AnnotationFlags> flags() const { return _flags; }
-  virtual QFlags<AnnotationFlags>& flags() { return _flags; }  
-  virtual QColor color() const { return _color; }
-
-  virtual void setRect(const QRectF rect) { _rect = rect; }
-  virtual void setContents(const QString contents) { _contents = contents; }
-  virtual void setPage(Page * page) { _page = page; }
-  virtual void setName(const QString name) { _name = name; }
-  virtual void setLastModified(const QDateTime lastModified) { _lastModified = lastModified; }
-  virtual void setColor(const QColor color) { _color = color; }
-
-protected:
-  QRectF _rect; // required
-  QString _contents; // optional
-  Page * _page; // optional; since PDF 1.3
-  QString _name; // optional; since PDF 1.4
-  QDateTime _lastModified; // optional; since PDF 1.1
-  // TODO: _flags, _appearance, _appearanceState, _border, _structParent, _optContent
-  QFlags<AnnotationFlags> _flags;
-  // QList<???> _appearance;
-  // ??? _appearanceState;
-  // ??? _border;
-  QColor _color;
-  // ??? _structParent;
-  // ??? _optContent;
-};
-Q_DECLARE_OPERATORS_FOR_FLAGS(PDFAnnotation::AnnotationFlags)
-
-class PDFDestination
-{
-public:
-  enum Type { Destination_XYZ, Destination_Fit, Destination_FitH, \
-              Destination_FitV, Destination_FitR, Destination_FitB, \
-              Destination_FitBH, Destination_FitBV };
-  PDFDestination(const int page = -1) : _page(page), _type(Destination_XYZ), _rect(QRectF(-1, -1, -1, -1)), _zoom(-1) { }
-  PDFDestination(const QString destinationName) : _destinationName(destinationName) { }
-
-  bool isValid() const { return _page >= 0 || !_destinationName.isEmpty(); }
-  // If the destination is not explicit (i.e., it is a named destination), use
-  // Document::resolveDestination() to resolve (this must be done just-in-time
-  // in case it refers to another document, or the name-to-destination mapping
-  // has changed since the PDFDestination object was constructed.
-  bool isExplicit() const { return _destinationName.isEmpty() && _page >= 0; }
-
-  int page() const { return _page; }
-  Type type() const { return _type; }
-  QString destinationName() const { return _destinationName; }
-  float zoom() const { return _zoom; }
-  float top() const { return _rect.top(); }
-  float left() const { return _rect.left(); }
-  QRectF rect() const { return _rect; }
-
-  // Returns the new viewport in the new page's coordinate system
-  // Note: the returned viewport may have a different aspect ratio than
-  // oldViewport. In that case, it view should be centered around the returned
-  // rect.
-  // Params:
-  //  - oldViewport: viewport in old page's coordinate system
-  //  - oldZoom
-  QRectF viewport(const Document * doc, const QRectF oldViewport, const float oldZoom) const;
-  
-  void setPage(const int page) { _page = page; }
-  void setType(const Type type) { _type = type; }
-  void setZoom(const float zoom) { _zoom = zoom; }
-  void setRect(const QRectF rect) { _rect = rect; }
-  void setDestinationName(const QString destinationName) { _destinationName = destinationName; }
-
-private:
-  int _page;
-  Type _type;
-  QString _destinationName;
-  QRectF _rect; // depending on _type, only some of the components might be significant
-  float _zoom;
-};
-
-#ifdef DEBUG
-  QDebug operator<<(QDebug dbg, const PDFDestination & dest);
-#endif
-
-
-// TODO: Possibly merge ActionTypeGoTo, ActionTypeGoToR, ActionTypeGoToE
-class PDFAction
-{
-public:
-  enum ActionType {
-    ActionTypeGoTo, /*ActionTypeGoToR,*/ ActionTypeGoToE, ActionTypeLaunch,
-    ActionTypeThread, ActionTypeURI, ActionTypeSound, ActionTypeMovie,
-    ActionTypeHide, ActionTypeNamed, ActionTypeSubmitForm, ActionTypeResetForm,
-    ActionTypeImportData, ActionTypeJavaScript, ActionTypeSetOCGState,
-    ActionTypeRendition, ActionTypeTrans, ActionTypeGoTo3DView
-  };
-
-  virtual ActionType type() const = 0;
-  virtual PDFAction * clone() const = 0;
-};
-
-class PDFURIAction : public PDFAction
-{
-public:
-  PDFURIAction(const QUrl url) : _url(url), _isMap(false) { }
-  PDFURIAction(const PDFURIAction & a) : _url(a._url), _isMap(a._isMap) { }
-  
-  ActionType type() const { return ActionTypeURI; }
-  PDFAction * clone() const { return new PDFURIAction(*this); }
-
-  // FIXME: handle _isMap (see PDF 1.7 specs)
-  QUrl url() const { return _url; }
-
-private:
-  QUrl _url;
-  bool _isMap;
-};
-
-class PDFGotoAction : public PDFAction
-{
-public:
-  PDFGotoAction(const PDFDestination destination = PDFDestination()) : _destination(destination), _isRemote(false), _openInNewWindow(false) { }
-  PDFGotoAction(const PDFGotoAction & a) : _destination(a._destination), _isRemote(a._isRemote), _filename(a._filename), _openInNewWindow(a._openInNewWindow) { }
-
-  ActionType type() const { return ActionTypeGoTo; }
-  PDFAction * clone() const { return new PDFGotoAction(*this); }
-
-  PDFDestination destination() const { return _destination; }
-  bool isRemote() const { return _isRemote; }
-  QString filename() const { return _filename; }
-  bool openInNewWindow() const { return _openInNewWindow; }
-
-  void setDestination(const PDFDestination destination) { _destination = destination; }
-  void setRemote(const bool remote = true) { _isRemote = remote; }
-  void setFilename(const QString filename) { _filename = filename; }
-  void setOpenInNewWindow(const bool openInNewWindow = true) { _openInNewWindow = openInNewWindow; }
-
-private:
-  PDFDestination _destination;
-  bool _isRemote;
-  QString _filename; // relevent only if _isRemote == true; should always refer to a PDF document (for other files, use PDFLaunchAction)
-  bool _openInNewWindow; // relevent only if _isRemote == true
-};
-
-class PDFLaunchAction : public PDFAction
-{
-public:
-  PDFLaunchAction(const QString command) : _command(command) { }
-
-  ActionType type() const { return ActionTypeLaunch; }
-  PDFAction * clone() const { return new PDFLaunchAction(*this); }
-  
-  QString command() const { return _command; }
-  void setCommand(const QString command) { _command = command; }
-
-  // FIXME: handle newWindow, implement OS-specific extensions
-private:
-  QString _command;
-  bool _newWindow;
-};
-
-class PDFLinkAnnotation : public PDFAnnotation
-{
-public:
-  enum HighlightingMode { HighlightingNone, HighlightingInvert, HighlightingOutline, HighlightingPush };
-
-  PDFLinkAnnotation() : PDFAnnotation(), _actionOnActivation(NULL) { }
-  virtual ~PDFLinkAnnotation();
-  
-  AnnotationType type() const { return AnnotationTypeLink; };
-
-  HighlightingMode highlightingMode() const { return _highlightingMode; }
-  QPolygonF quadPoints() const;
-  PDFAction * actionOnActivation() const { return _actionOnActivation; }
-
-  void setHighlightingMode(const HighlightingMode mode) { _highlightingMode = mode; }
-  void setQuadPoints(const QPolygonF quadPoints) { _quadPoints = quadPoints; }
-  // Note: PDFLinkAnnotation takes ownership of PDFAction pointers
-  void setActionOnActivation(PDFAction * const action);
-
-private:
-  // Note: the PA member of the link annotation dict is deliberately ommitted
-  // because we don't support WebCapture at the moment
-  // Note: The PDF specs include a "destination" field for LinkAnnotations;
-  // In this implementation this case should be handled by a PDFGoToAction
-  HighlightingMode _highlightingMode;
-  QPolygonF _quadPoints;
-  PDFAction * _actionOnActivation;
-};
 
 class PDFFontDescriptor
 {
@@ -419,12 +193,6 @@ protected:
   mutable QReadWriteLock _lock;
 };
 
-// FIXME: the program segfaults if the page is destroyed while a page processing
-// request is executed. Note that using QSharedPointer doesn't help here as
-// processing requests are usually initiated from the Page object in question
-// which can only create a new QSharedPointer object which would interfere with
-// QSharedPointer held by other objects (but inaccessible to the Page in
-// question - see documentation of QSharedPointer)
 class PageProcessingRequest : public QObject
 {
   Q_OBJECT
@@ -456,27 +224,23 @@ class PageProcessingRenderPageRequest : public PageProcessingRequest
   Q_OBJECT
   friend class PDFPageProcessingThread;
 
-  // Protect c'tor and execute() so we can't access them except in derived
-  // classes and friends
-protected:
+public:
   PageProcessingRenderPageRequest(Page *page, QObject *listener, double xres, double yres, QRect render_box = QRect(), bool cache = false) :
     PageProcessingRequest(page, listener),
     xres(xres), yres(yres),
     render_box(render_box),
     cache(cache)
   {}
-
-  bool execute();
-
-public:
   Type type() const { return PageRendering; }
-  
+
   virtual bool operator==(const PageProcessingRequest & r) const;
+
+protected:
+  bool execute();
 
   double xres, yres;
   QRect render_box;
   bool cache;
-
 };
 
 
@@ -505,15 +269,12 @@ class PageProcessingLoadLinksRequest : public PageProcessingRequest
   Q_OBJECT
   friend class PDFPageProcessingThread;
 
-  // Protect c'tor and execute() so we can't access them except in derived
-  // classes and friends
-protected:
-  PageProcessingLoadLinksRequest(Page *page, QObject *listener) : PageProcessingRequest(page, listener) { }
-  bool execute();
-
 public:
+  PageProcessingLoadLinksRequest(Page *page, QObject *listener) : PageProcessingRequest(page, listener) { }
   Type type() const { return LoadLinks; }
 
+protected:
+  bool execute();
 };
 
 
@@ -543,9 +304,6 @@ class PDFPageProcessingThread : public QThread
 public:
   PDFPageProcessingThread();
   virtual ~PDFPageProcessingThread();
-
-  void requestRenderPage(Page *page, QObject *listener, double xres, double yres, QRect render_box = QRect(), bool cache = false);
-  void requestLoadLinks(Page *page, QObject *listener);
 
   // add a processing request to the work stack
   // Note: request must have been created on the heap and must be in the scope
@@ -607,6 +365,13 @@ protected:
 
 typedef QList<PDFToCItem> PDFToC;
 
+struct  SearchRequest
+{
+  QSharedPointer<Document> doc;
+  int pageNum;
+  QString searchString;
+};
+
 struct  SearchResult
 {
   int pageNum;
@@ -620,6 +385,8 @@ struct  SearchResult
 // documents. Having a set of abstract classes allows tools like GUI viewers to
 // be written that are agnostic to the library that provides the actual PDF
 // implementation: Poppler, MuPDF, etc.
+// TODO: Should this class be derived from QObject to emit signals (e.g., 
+// documentChanged() after reload, unlocking, etc.)?
 
 class Document
 {
@@ -627,6 +394,16 @@ class Document
 
 public:
   enum TrappedState { Trapped_Unknown, Trapped_True, Trapped_False };
+  enum Permission { Permission_Print = 0x0004,
+                    Permission_Change = 0x0008,
+                    Permission_Extract = 0x0010, // text and graphics
+                    Permission_Annotate = 0x0020, // Also includes filling forms
+                    Permission_FillForm = 0x0100,
+                    Permission_ExtractForAccessibility = 0x0200,
+                    Permission_Assemble = 0x0400,
+                    Permission_PrintHighRes = 0x0800
+                  };
+  Q_DECLARE_FLAGS(Permissions, Permission)
 
   Document(QString fileName);
   virtual ~Document();
@@ -639,6 +416,15 @@ public:
   virtual PDFDestination resolveDestination(const PDFDestination & namedDestination) const {
     return (namedDestination.isExplicit() ? namedDestination : PDFDestination());
   }
+
+  QFlags<Permissions> permissions() const { return _permissions; }
+  QFlags<Permissions>& permissions() { return _permissions; }
+  
+  virtual bool isValid() const = 0;
+  virtual bool isLocked() const = 0;
+
+  // Returns `true` if unlocking was successful and `false` otherwise.  
+  virtual bool unlock(const QString password) = 0;
   
   // Override in derived class if it provides access to the document outline
   // strutures of the pdf file.
@@ -674,6 +460,9 @@ protected:
   PDFPageProcessingThread _processingThread;
   PDFPageCache _pageCache;
   QVector< QSharedPointer<Page> > _pages;
+  QFlags<Permissions> _permissions;
+
+  QString _fileName;
 
   QString _meta_title;
   QString _meta_author;
@@ -699,14 +488,13 @@ public:
   virtual ~Page();
 
   int pageNum();
-  virtual QSizeF pageSizeF()=0;
+  virtual QSizeF pageSizeF() const = 0;
 
   Document * document() { return _parent; }
 
   virtual QImage renderToImage(double xres, double yres, QRect render_box = QRect(), bool cache = false)=0;
   virtual void asyncRenderToImage(QObject *listener, double xres, double yres, QRect render_box = QRect(), bool cache = false);
 
-  // FIXME: take care that the links are destroyed - maybe use QSharedPointer?
   virtual QList< QSharedPointer<PDFLinkAnnotation> > loadLinks() = 0;
   virtual void asyncLoadLinks(QObject *listener);
 
@@ -733,6 +521,8 @@ public:
   // This is very tricky to do in C++. God I miss Python and its `itertools`
   // library.
   virtual QList<SearchResult> search(QString searchText) = 0;
+
+  static QList<SearchResult> search(SearchRequest request);
 };
 
 

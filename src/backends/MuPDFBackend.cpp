@@ -15,7 +15,16 @@
 // NOTE: `MuPDFBackend.h` is included via `PDFBackend.h`
 #include <PDFBackend.h>
 
+#ifdef HAVE_LOCALE_H
+#include <locale.h>
+#endif // defined(HAVE_LOCALE_H)
+
 QRectF toRectF(const fz_rect r)
+{
+  return QRectF(QPointF(r.x0, r.y0), QPointF(r.x1, r.y1));
+}
+
+QRectF toRectF(const fz_bbox r)
 {
   return QRectF(QPointF(r.x0, r.y0), QPointF(r.x1, r.y1));
 }
@@ -227,25 +236,34 @@ PDFDestination toPDFDestination(pdf_xref * xref, fz_obj * dest)
 
 #endif
 
+// Modeled after the idea behind QMutexLocker, i.e., the class sets LC_NUMERIC
+// to "C" in the contructor and resets the original setting in the destructor
+#ifdef HAVE_LOCALE_H
+class MuPDFLocaleResetter
+{
+  char * _locale;
+public:
+  MuPDFLocaleResetter() { _locale = setlocale(LC_NUMERIC, NULL); setlocale(LC_NUMERIC, "C"); }
+  ~MuPDFLocaleResetter() { setlocale(LC_NUMERIC, _locale); }
+};
+#else
+class MuPDFLocaleResetter
+{
+public:
+  MuPDFLocaleResetter() { }
+};
+#endif // defined(HAVE_LOCALE_H)
+
 
 // Document Class
 // ==============
 MuPDFDocument::MuPDFDocument(QString fileName):
   Super(fileName),
-  _glyph_cache(fz_new_glyph_cache())
+  _glyph_cache(fz_new_glyph_cache()),
+  _mupdf_data(NULL)
 {
-  // NOTE: The next two calls can fail---we need to check for that
-  fz_stream *pdf_file = fz_open_file(fileName.toLocal8Bit().data());
-  pdf_open_xref_with_stream(&_mupdf_data, pdf_file, NULL);
-  fz_close(pdf_file);
-
-  // NOTE: This can also fail.
-  pdf_load_page_tree(_mupdf_data);
-
-  _numPages = pdf_count_pages(_mupdf_data);
-
-
-  loadMetaData();
+  _fileName = fileName;
+  reload();
 }
 
 MuPDFDocument::~MuPDFDocument()
@@ -258,10 +276,98 @@ MuPDFDocument::~MuPDFDocument()
   fz_free_glyph_cache(_glyph_cache);
 }
 
+void MuPDFDocument::reload()
+{
+  MuPDFLocaleResetter lr;
+
+  if (_mupdf_data) {
+    pdf_free_xref(_mupdf_data);
+    _mupdf_data = NULL;
+  }
+
+  fz_stream *pdf_file = fz_open_file(_fileName.toLocal8Bit().data());
+  if (!pdf_file)
+    return;
+  pdf_open_xref_with_stream(&_mupdf_data, pdf_file, NULL);
+  fz_close(pdf_file);
+
+  if (!_mupdf_data)
+    return;
+
+  // Permission level determination works as follows:
+  // 1) If there is no `crypt` dictionary, there is no security set, and
+  //    consequently we have full permissions (i.e., owner level)
+  // 2) If there is a `crypt` dictionary and we have a password to try, do that.
+  //    Note: MuPDF currently doesn't provide any way to distinguish user from
+  //    owner password, so to be on the safe side we always assume the lower
+  //    (i.e. user) permission level
+  // 3) If we have `crypt` but no password, see if that is enough for user level
+  // 4) Otherwise, the document is locked
+  if (!_mupdf_data->crypt)
+    _permissionLevel = PermissionLevel_Owner;
+  else if (!_password.isEmpty()) {
+    // TODO: Check if toUtf8 makes sense
+    // TODO: Revisit this once MuPDF tells us the permission level we have
+    if (pdf_authenticate_password(_mupdf_data, _password.toUtf8().data()))
+      _permissionLevel = PermissionLevel_User;
+    else
+      _permissionLevel = PermissionLevel_Locked;
+  }
+  else if (!pdf_needs_password(_mupdf_data))
+    _permissionLevel = PermissionLevel_User;
+  else
+    _permissionLevel = PermissionLevel_Locked;
+
+  // Permissions
+  // - at `Locked` level, we have no permissions
+  // - at `User` level, we take the permissions from MuPDF
+  // - at `Owner` level, we assume full permissions (note that pdf_has_permission
+  //   doesn't distinguish between user and owner level)
+  switch (_permissionLevel) {
+    case PermissionLevel_Locked:
+      _permissions = QFlags<Permissions>();
+      break;
+    case PermissionLevel_User:
+      _permissions = QFlags<Permissions>();
+      if (pdf_has_permission(_mupdf_data, PDF_PERM_PRINT))
+        _permissions |= Permission_Print;
+      if (pdf_has_permission(_mupdf_data, PDF_PERM_CHANGE))
+        _permissions |= Permission_Change;
+      if (pdf_has_permission(_mupdf_data, PDF_PERM_COPY))
+        _permissions |= Permission_Extract;
+      if (pdf_has_permission(_mupdf_data, PDF_PERM_NOTES))
+        _permissions |= Permission_Annotate;
+      if (pdf_has_permission(_mupdf_data, PDF_PERM_FILL_FORM))
+        _permissions |= Permission_FillForm;
+      if (pdf_has_permission(_mupdf_data, PDF_PERM_ACCESSIBILITY))
+        _permissions |= Permission_ExtractForAccessibility;
+      if (pdf_has_permission(_mupdf_data, PDF_PERM_ASSEMBLE))
+        _permissions |= Permission_Assemble;
+      if (pdf_has_permission(_mupdf_data, PDF_PERM_HIGH_RES_PRINT))
+        _permissions |= Permission_PrintHighRes;
+      break;
+    case PermissionLevel_Owner:
+      _permissions = QFlags<Permissions>(Permission_Print | \
+                                         Permission_Change | \
+                                         Permission_Extract | \
+                                         Permission_Annotate | \
+                                         Permission_FillForm | \
+                                         Permission_ExtractForAccessibility | \
+                                         Permission_Assemble | \
+                                         Permission_PrintHighRes);
+      break;
+  }
+
+  // NOTE: This can also fail.
+  pdf_load_page_tree(_mupdf_data);
+  _numPages = pdf_count_pages(_mupdf_data);
+  loadMetaData();
+}
+
 QSharedPointer<Page> MuPDFDocument::page(int at)
 {
-  // FIXME: Come up with something to deal with a zero-page PDF.
-  assert(_numPages != 0);
+  if (at < 0 || at >= _numPages)
+    return QSharedPointer<Page>();
 
   if( _pages.isEmpty() )
     _pages.resize(_numPages);
@@ -274,8 +380,14 @@ QSharedPointer<Page> MuPDFDocument::page(int at)
 
 void MuPDFDocument::loadMetaData()
 {
+  MuPDFLocaleResetter lr;
+
   char infoName[] = "Info"; // required because fz_dict_gets is not prototyped to take const char *
 
+  if (isLocked())
+    return;
+
+  // TODO: Handle encrypted meta data
   // Note: fz_is_dict(NULL)===0, i.e., it doesn't crash
   if (!fz_is_dict(_mupdf_data->trailer))
     return;
@@ -332,6 +444,8 @@ void MuPDFDocument::loadMetaData()
 
 PDFDestination MuPDFDocument::resolveDestination(const PDFDestination & namedDestination) const
 {
+  MuPDFLocaleResetter lr;
+
   Q_ASSERT(_mupdf_data != NULL);
   
   // TODO: Test this method
@@ -351,6 +465,8 @@ PDFDestination MuPDFDocument::resolveDestination(const PDFDestination & namedDes
 
 QList<PDFFontInfo> MuPDFDocument::fonts() const
 {
+  MuPDFLocaleResetter lr;
+
   int i;
   char typeKey[] = "Type";
   char subtypeKey[] = "Subtype";
@@ -362,6 +478,9 @@ QList<PDFFontInfo> MuPDFDocument::fonts() const
   char fontfile2Key[] = "FontFile2";
   char fontfile3Key[] = "FontFile3";
   QList<PDFFontInfo> retVal;
+
+  if (!_mupdf_data)
+    return retVal;
 
 #ifdef DEBUG
   QTime timer;
@@ -512,13 +631,40 @@ void MuPDFDocument::recursiveConvertToC(QList<PDFToCItem> & items, pdf_outline *
 
 PDFToC MuPDFDocument::toc() const
 {
-  Q_ASSERT(_mupdf_data != NULL);
+  MuPDFLocaleResetter lr;
+
   PDFToC retVal;
+
+  if (!_mupdf_data)
+    return retVal;
+
   pdf_outline * outline = pdf_load_outline(_mupdf_data);
-  recursiveConvertToC(retVal, outline);
-  pdf_free_outline(outline);
+  if (outline) {
+    recursiveConvertToC(retVal, outline);
+    pdf_free_outline(outline);
+  }
   return retVal;
 }
+
+bool MuPDFDocument::unlock(const QString password)
+{
+  if (!_mupdf_data)
+    return false;
+
+  // Note: we try unlocking regardless of what isLocked() returns as the user
+  // might want to unlock a document with the owner's password when user level
+  // access is already granted.
+  // TODO: Check if toUtf8 makes sense
+  bool success = pdf_authenticate_password(_mupdf_data, password.toUtf8().data());
+
+  if (success)
+    _password = password;
+  // Note: Reload in any case as pdf_authenticate_password can even relock the
+  // document (which reload() undoes)
+  reload();
+  return success;
+}
+
 
 // Page Class
 // ==========
@@ -526,6 +672,8 @@ MuPDFPage::MuPDFPage(MuPDFDocument *parent, int at):
   Super(parent, at),
   _linksLoaded(false)
 {
+  MuPDFLocaleResetter lr;
+
   pdf_page *page_data;
   pdf_load_page(&page_data, parent->_mupdf_data, _n);
 
@@ -552,7 +700,7 @@ MuPDFPage::~MuPDFPage()
   _mupdf_page = NULL;
 }
 
-QSizeF MuPDFPage::pageSizeF() { return _size; }
+QSizeF MuPDFPage::pageSizeF() const { return _size; }
 
 QImage MuPDFPage::renderToImage(double xres, double yres, QRect render_box, bool cache)
 {
@@ -609,16 +757,14 @@ QImage MuPDFPage::renderToImage(double xres, double yres, QRect render_box, bool
 
 QList< QSharedPointer<PDFLinkAnnotation> > MuPDFPage::loadLinks()
 {
+  MuPDFLocaleResetter lr;
+
   if (_linksLoaded)
     return _links;
 
   Q_ASSERT(_parent != NULL);
   pdf_xref * xref = static_cast<MuPDFDocument*>(_parent)->_mupdf_data;
   Q_ASSERT(xref != NULL);
-
-  // FIXME: PDFLinkGraphicsItem erroneously requires coordinates to be
-  // normalized to [0..1].
-  QTransform normalize = QTransform::fromScale(1. / _size.width(), -1. / _size.height()).translate(0, -_size.height());
 
   _linksLoaded = true;
   pdf_page * page;
@@ -631,7 +777,7 @@ QList< QSharedPointer<PDFLinkAnnotation> > MuPDFPage::loadLinks()
 
   while (mupdfLink) {
     QSharedPointer<PDFLinkAnnotation> link(new PDFLinkAnnotation);
-    link->setRect(normalize.mapRect(toRectF(mupdfLink->rect)));
+    link->setRect(toRectF(mupdfLink->rect));
     link->setPage(this);
     // FIXME: Initialize all other properties of PDFLinkAnnotation, such as
     // border, color, quadPoints, etc.
@@ -676,7 +822,73 @@ QList<SearchResult> MuPDFPage::search(QString searchText)
 {
   // FIXME: Currently unimplemented and always returns an empty list.
   QList<SearchResult> results;
+  fz_text_span * page_text, * span;
+  fz_device * dev;
+  QString text;
+  int i, j, k, spanStart;
 
+  // Use MuPDF transformations to get the text box coordinates right already
+  // during fz_execute_display_list().
+  fz_matrix render_trans = fz_identity;
+  render_trans = fz_concat(render_trans, fz_translate(0, -_bbox.y1));
+  render_trans = fz_concat(render_trans, fz_scale(1, -1));
+  render_trans = fz_concat(render_trans, fz_rotate(_rotate));
+
+  if (!_mupdf_page)
+    return results;
+
+  // Extract text from page
+  page_text = fz_new_text_span();
+  dev = fz_new_text_device(page_text);
+  fz_execute_display_list(_mupdf_page, dev, render_trans, fz_infinite_bbox);
+  fz_free_device(dev);
+
+  // Convert fz_text_spans to QString
+  // TODO: Decide what to do about the space MuPDF prepends and appends to each
+  // line (at least for the base14-fonts.pdf test case).
+  for (span = page_text; span != NULL; span = span->next) {
+    for (i = 0; i < span->len; ++i)
+      text.append(span->text[i].c);
+    if (span->eol)
+      text.append('\n');
+  }
+
+  // Perform the actual search and extract box information
+  i = 0;
+  spanStart = 0;
+  span = page_text;
+  while ((i = text.indexOf(searchText, i, Qt::CaseInsensitive)) >= 0) {
+    // Search for the text span(s) the string is coming from. Note: Because we
+    // are doing a forward search only, we don't need to reset `span` or
+    // `spanStart`.
+    for (; span != NULL; span = span->next) {
+      if (i < spanStart + span->len)
+        break;
+      spanStart += span->len;
+      if (span->eol)
+        ++spanStart;
+    }
+    if (!span)
+      break;
+
+    SearchResult result;
+    result.pageNum = pageNum();
+    for (j = 0; j < searchText.length(); ++j) {
+      while (span && i + j >= spanStart + span->len) {
+        spanStart += span->len;
+        if (span->eol)
+          ++spanStart;
+        span = span->next;
+      }
+      result.bbox |= toRectF(span->text[i + j - spanStart].bbox);
+    }
+    results << result;
+
+    // Offset `i` so we don't find the same match over and over again    
+    i += searchText.length();
+  }
+
+  fz_free_text_span(page_text);
   return results;
 }
 
