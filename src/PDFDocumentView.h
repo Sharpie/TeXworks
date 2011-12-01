@@ -24,9 +24,6 @@ class PDFPageGraphicsItem;
 class PDFLinkGraphicsItem;
 class PDFDocumentMagnifierView;
 class PDFActionEvent;
-class PDFToCDockWidget;
-class PDFMetaDataDockWidget;
-class PDFFontsDockWidget;
 
 const int TILE_SIZE=1024;
 
@@ -34,7 +31,7 @@ class PDFDocumentView : public QGraphicsView {
   Q_OBJECT
   typedef QGraphicsView Super;
 
-  PDFDocumentScene *_pdf_scene;
+  QSharedPointer<PDFDocumentScene> _pdf_scene;
   PDFDocumentMagnifierView * _magnifier;
 
   QRubberBand *_rubberBand;
@@ -46,35 +43,46 @@ class PDFDocumentView : public QGraphicsView {
 
   QString _searchString;
   QList<QGraphicsItem *> _searchResults;
+  QFutureWatcher< QList<SearchResult> > _searchResultWatcher;
   int _currentSearchResult;
+  bool _useGrayScale;
 
 public:
   enum PageMode { PageMode_SinglePage, PageMode_OneColumnContinuous, PageMode_TwoColumnContinuous };
   enum MouseMode { MouseMode_MagnifyingGlass, MouseMode_Move, MouseMode_MarqueeZoom };
   enum Tool { Tool_None, Tool_MagnifyingGlass, Tool_ZoomIn, Tool_ZoomOut, Tool_MarqueeZoom, Tool_Move, Tool_ContextMenu, Tool_ContextClick };
   enum MagnifierShape { Magnifier_Rectangle, Magnifier_Circle };
+  enum Dock { Dock_TableOfContents, Dock_MetaData, Dock_Fonts, Dock_Permissions };
 
   PDFDocumentView(QWidget *parent = 0);
-  void setScene(PDFDocumentScene *a_scene);
+  ~PDFDocumentView();
+  void setScene(QSharedPointer<PDFDocumentScene> a_scene);
   int currentPage();
   int lastPage();
   PageMode pageMode() const { return _pageMode; }
   qreal zoomLevel() const { return _zoomLevel; }
+  bool useGrayScale() const { return _useGrayScale; }
 
   // The ownership of the returned pointers is transferred to the caller (i.e.,
   // he has to destroy them, unless the `parent` widget does that automatically)
   // They are fully wired to this PDFDocumentView (e.g., clicking on entries in
   // the table of contents will change this view)
-  QDockWidget * tocDockWidget(QWidget * parent);
-  QDockWidget * metaDataDockWidget(QWidget * parent);
-  QDockWidget * fontsDockWidget(QWidget * parent);
+  QDockWidget * dockWidget(const Dock type, QWidget * parent = NULL);
 
 public slots:
   void goPrev();
   void goNext();
   void goFirst();
   void goLast();
-  void goToPage(int pageNum, bool centerOnTop = true);
+  // `alignment` can be (a combination of) 0, Qt::AlignLeft, Qt::AlignRight,
+  // Qt::AlignHCenter, Qt::AlignTop, Qt::AlignBottom, Qt::AlignVCenter.
+  // 0 corresponds to no alignment, i.e., the view will change so that the
+  // rectangle of page pageNum closest to the original viewport rect is visible.
+  void goToPage(const int pageNum, const int alignment = Qt::AlignLeft | Qt::AlignTop);
+  // Similar to the one above, but view is aligned at `anchor`. Note that the
+  // default alignment is centering here, which is also used if `alignment` == 0.
+  // `anchor` must be given in item coordinates
+  void goToPage(const int pageNum, const QPointF anchor, const int alignment = Qt::AlignHCenter | Qt::AlignVCenter);
   void setPageMode(PageMode pageMode);
   void setSinglePageMode() { setPageMode(PageMode_SinglePage); }
   void setOneColContPageMode() { setPageMode(PageMode_OneColumnContinuous); }
@@ -85,6 +93,7 @@ public slots:
   void setMouseModeMarqueeZoom() { setMouseMode(MouseMode_MarqueeZoom); }
   void setMagnifierShape(const MagnifierShape shape);
   void setMagnifierSize(const int size);
+  void setUseGrayScale(const bool grayScale = true) { _useGrayScale = grayScale; }
 
   void zoomBy(qreal zoomFactor);
   void zoomIn();
@@ -101,6 +110,8 @@ public slots:
 signals:
   void changedPage(int pageNum);
   void changedZoom(qreal zoomLevel);
+
+  void searchProgressChanged(int percent, int occurrences);
 
   void requestOpenUrl(const QUrl url);
   void requestExecuteCommand(QString command);
@@ -134,8 +145,12 @@ protected slots:
   void maybeUpdateSceneRect();
   void pdfActionTriggered(const PDFAction * action);
   // Note: view specifies which part of the page should be visible and must
-  // therefore be given in scene coordinates
+  // therefore be given in page coordinates
   void goToPage(const PDFPageGraphicsItem * page, const QRectF view, const bool mayZoom = false);
+  void goToPage(const PDFPageGraphicsItem * page, const int alignment = Qt::AlignLeft | Qt::AlignTop);
+  void goToPage(const PDFPageGraphicsItem * page, const QPointF anchor, const int alignment = Qt::AlignHCenter | Qt::AlignVCenter);
+  void searchResultReady(int index);
+  void searchProgressValueChanged(int progressValue);
 
 private:
   PageMode _pageMode;
@@ -185,32 +200,50 @@ protected:
   QPixmap _dropShadow;
 };
 
-class PDFToCDockWidget : public QDockWidget
+class PDFDocumentInfoWidget : public QWidget
+{
+  Q_OBJECT
+  friend class PDFDocumentView;
+public:
+  PDFDocumentInfoWidget(QWidget * parent = NULL, const QString & title = QString()) : QWidget(parent) { setWindowTitle(title); }
+  virtual ~PDFDocumentInfoWidget() { }
+  // If the widget has a fixed size, it should not be resized (it can, e.g., be
+  // put into a QScrollArea instead).
+protected slots:
+  virtual void initFromDocument(const QSharedPointer<Document> doc) = 0;
+  virtual void clear() = 0;
+};
+
+class PDFToCInfoWidget : public PDFDocumentInfoWidget
 {
   Q_OBJECT
 public:
-  PDFToCDockWidget(QWidget * parent);
-  virtual ~PDFToCDockWidget();
-  
-  void setToCData(const PDFToC data);
+  PDFToCInfoWidget(QWidget * parent);
+  virtual ~PDFToCInfoWidget();
+
+protected slots:
+  void initFromDocument(const QSharedPointer<Document> doc);
+  void clear();
 signals:
   void actionTriggered(const PDFAction*);
 private slots:
   void itemSelectionChanged();
 private:
-  void clearTree();
   static void recursiveAddTreeItems(const QList<PDFToCItem> & tocItems, QTreeWidgetItem * parentTreeItem);
   static void recursiveClearTreeItems(QTreeWidgetItem * parent);
+  QTreeWidget * _tree;
 };
 
-class PDFMetaDataDockWidget : public QDockWidget
+class PDFMetaDataInfoWidget : public PDFDocumentInfoWidget
 {
   Q_OBJECT
 public:
-  PDFMetaDataDockWidget(QWidget * parent);
-  virtual ~PDFMetaDataDockWidget() { }
+  PDFMetaDataInfoWidget(QWidget * parent);
+  virtual ~PDFMetaDataInfoWidget() { }
   
-  void setMetaDataFromDocument(const QSharedPointer<Document> doc);
+protected slots:
+  void initFromDocument(const QSharedPointer<Document> doc);
+  void clear();
 private:
   QLabel * _title;
   QLabel * _author;
@@ -224,16 +257,36 @@ private:
   QGroupBox * _other;
 };
 
-class PDFFontsDockWidget : public QDockWidget
+class PDFFontsInfoWidget : public PDFDocumentInfoWidget
 {
   Q_OBJECT
 public:
-  PDFFontsDockWidget(QWidget * parent);
-  virtual ~PDFFontsDockWidget() { }
+  PDFFontsInfoWidget(QWidget * parent);
+  virtual ~PDFFontsInfoWidget() { }
   
-  void setFontsDataFromDocument(const QSharedPointer<Document> doc);
+protected slots:
+  void initFromDocument(const QSharedPointer<Document> doc);
+  void clear();
 private:
   QTableWidget * _table;
+};
+
+class PDFPermissionsInfoWidget : public PDFDocumentInfoWidget
+{
+  Q_OBJECT
+public:
+  PDFPermissionsInfoWidget(QWidget * parent);
+  virtual ~PDFPermissionsInfoWidget() { }
+  
+protected slots:
+  void initFromDocument(const QSharedPointer<Document> doc);
+  void clear();
+private:
+  QLabel * _print;
+  QLabel * _modify;
+  QLabel * _extract;
+  QLabel * _addNotes;
+  QLabel * _form;
 };
 
 // Cannot use QGraphicsGridLayout and similar classes for pages because it only
@@ -308,10 +361,11 @@ public:
   QList<QGraphicsItem*> pages(const QPolygonF &polygon);
   QGraphicsItem* pageAt(const int idx);
   int pageNumAt(const QPolygonF &polygon);
-  int pageNumFor(PDFPageGraphicsItem * const graphicsItem) const;
+  int pageNumFor(const PDFPageGraphicsItem * const graphicsItem) const;
   PDFPageLayout& pageLayout() { return _pageLayout; }
 
   void showOnePage(const int pageIdx) const;
+  void showOnePage(const PDFPageGraphicsItem * page) const;
   void showAllPages() const;
 
   int lastPage();
@@ -322,9 +376,14 @@ signals:
   void pageChangeRequested(int pageNum);
   void pageLayoutChanged();
   void pdfActionTriggered(const PDFAction * action);
+  void documentChanged(const QSharedPointer<Document> doc);
+
+public slots:
+  void doUnlockDialog();
 
 protected slots:
   void pageLayoutChanged(const QRectF& sceneRect);
+  void reinitializeScene();
 
 protected:
   bool event(QEvent* event);
@@ -360,6 +419,8 @@ class PDFPageGraphicsItem : public QGraphicsObject
   friend class PageProcessingRenderPageRequest;
   friend class PageProcessingLoadLinksRequest;
   friend class PDFPageLayout;
+
+  static void imageToGrayScale(QImage & img);
 
 public:
 

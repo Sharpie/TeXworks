@@ -49,11 +49,25 @@ public:
   MuPDFDocument(QString fileName);
   ~MuPDFDocument();
 
+  bool isValid() const { return (_mupdf_data != NULL); }
+  bool isLocked() const { return (isValid() && _permissionLevel == PermissionLevel_Locked); }
+
+  bool unlock(const QString password);
+  void reload();
+
   QSharedPointer<Page> page(int at);
   PDFDestination resolveDestination(const PDFDestination & namedDestination) const;
 
   PDFToC toc() const;
   QList<PDFFontInfo> fonts() const;
+
+private:
+  enum PermissionLevel { PermissionLevel_Locked, PermissionLevel_User, PermissionLevel_Owner };
+  QString _password;
+  // NOTE: the MuPDF function pdf_needs_password actually tries to authenticate
+  // with an empty password under certain circumstances. This can effectively
+  // relock _mupdf_data, so we have to cache to `locked` state.
+  PermissionLevel _permissionLevel;
 };
 
 
@@ -77,7 +91,7 @@ public:
   MuPDFPage(MuPDFDocument *parent, int at);
   ~MuPDFPage();
 
-  QSizeF pageSizeF();
+  QSizeF pageSizeF() const;
 
   QImage renderToImage(double xres, double yres, QRect render_box = QRect(), bool cache = false);
 

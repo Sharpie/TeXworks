@@ -73,6 +73,39 @@ PDFDestination toPDFDestination(const Poppler::Document * doc, const Poppler::Li
   return retVal;
 }
 
+void convertAnnotation(PDFAnnotation * dest, const Poppler::Annotation * src, Page * page)
+{
+  if (!dest || !src || !page)
+    return;
+
+  QTransform denormalize = QTransform::fromScale(page->pageSizeF().width(), -page->pageSizeF().height()).translate(0,  -1);
+
+  dest->setRect(denormalize.mapRect(src->boundary()));
+  dest->setContents(src->contents());
+  dest->setName(src->uniqueName());
+  dest->setLastModified(src->modificationDate());
+  dest->setPage(page);
+
+  // TODO: Does poppler provide the color anywhere?
+  // dest->setColor();
+
+  QFlags<PDFAnnotation::AnnotationFlags>& flags = dest->flags();
+  flags = QFlags<PDFAnnotation::AnnotationFlags>();
+  if (src->flags() & Poppler::Annotation::Hidden)
+    flags |= PDFAnnotation::Annotation_Hidden;
+  if (src->flags() & Poppler::Annotation::FixedSize)
+    flags |= PDFAnnotation::Annotation_NoZoom;
+  if (src->flags() & Poppler::Annotation::FixedRotation)
+    flags |= PDFAnnotation::Annotation_NoRotate;
+  if (src->flags() & Poppler::Annotation::DenyPrint == 0)
+    flags |= PDFAnnotation::Annotation_Print;
+  if (src->flags() & Poppler::Annotation::DenyWrite)
+    flags |= PDFAnnotation::Annotation_ReadOnly;
+  if (src->flags() & Poppler::Annotation::DenyDelete)
+    flags |= PDFAnnotation::Annotation_Locked;
+  if (src->flags() & Poppler::Annotation::ToggleHidingOnMouse)
+    flags |= PDFAnnotation::Annotation_ToggleNoView;
+}
 
 
 // Document Class
@@ -82,7 +115,40 @@ PopplerDocument::PopplerDocument(QString fileName):
   _poppler_doc(Poppler::Document::load(fileName)),
   _doc_lock(new QMutex())
 {
+  parseDocument();
+}
+
+PopplerDocument::~PopplerDocument()
+{
+}
+
+void PopplerDocument::parseDocument()
+{
+  if (!_poppler_doc || isLocked())
+    return;
+
   _numPages = _poppler_doc->numPages();
+
+  // Permissions
+  // TODO: Check if this mapping from Poppler flags to our flags is correct
+  if (_poppler_doc->okToAddNotes())
+    _permissions |= Permission_Annotate;
+  if (_poppler_doc->okToAssemble())
+    _permissions |= Permission_Assemble;
+  if (_poppler_doc->okToChange())
+    _permissions |= Permission_Change;
+  if (_poppler_doc->okToCopy())
+    _permissions |= Permission_Extract;
+  if (_poppler_doc->okToCreateFormFields())
+    _permissions |= Permission_Annotate;
+  if (_poppler_doc->okToExtractForAccessibility())
+    _permissions |= Permission_ExtractForAccessibility;
+  if (_poppler_doc->okToFillForm())
+    _permissions |= Permission_FillForm;
+  if (_poppler_doc->okToPrint())
+    _permissions |= Permission_Print;
+  if (_poppler_doc->okToPrintHighRes())
+    _permissions |= Permission_PrintHighRes;
 
   // **TODO:**
   //
@@ -137,14 +203,10 @@ PopplerDocument::PopplerDocument(QString fileName):
     _meta_other[key] = _poppler_doc->info(key);
 }
 
-PopplerDocument::~PopplerDocument()
-{
-}
-
 QSharedPointer<Page> PopplerDocument::page(int at)
 {
-  // FIXME: Come up with something to deal with a zero-page PDF.
-  Q_ASSERT(_numPages != 0);
+  if (at < 0 || at >= _numPages)
+    return QSharedPointer<Page>();
 
   if( _pages.isEmpty() )
     _pages.resize(_numPages);
@@ -210,7 +272,7 @@ void PopplerDocument::recursiveConvertToC(QList<PDFToCItem> & items, QDomNode no
 PDFToC PopplerDocument::toc() const
 {
   PDFToC retVal;
-  if (!_poppler_doc)
+  if (!_poppler_doc || isLocked())
     return retVal;
 
   QDomDocument * toc = _poppler_doc->toc();
@@ -224,7 +286,7 @@ PDFToC PopplerDocument::toc() const
 QList<PDFFontInfo> PopplerDocument::fonts() const
 {
   QList<PDFFontInfo> retVal;
-  if (!_poppler_doc)
+  if (!_poppler_doc || isLocked())
     return retVal;
 
   foreach(Poppler::FontInfo popplerFontInfo, _poppler_doc->fonts()) {
@@ -300,6 +362,25 @@ QList<PDFFontInfo> PopplerDocument::fonts() const
   return retVal;
 }
 
+bool PopplerDocument::unlock(const QString password)
+{
+  if (!_poppler_doc)
+    return false;
+  // Note: we try unlocking regardless of what isLocked() returns as the user
+  // might want to unlock a document with the owner's password when user level
+  // access is already granted.
+  bool success = !_poppler_doc->unlock(password.toLatin1(), password.toLatin1());
+
+  if (success)
+    parseDocument();
+
+  // FIXME: Store password for this session in case we need to reload the
+  // document later on (e.g., if it has changed on the disk)
+
+  return success;
+}
+
+
 // Page Class
 // ==========
 PopplerPage::PopplerPage(PopplerDocument *parent, int at):
@@ -316,7 +397,10 @@ PopplerPage::~PopplerPage()
 // TODO: Does this operation require obtaining the Poppler document mutex? If
 // so, it would be better to store the value in a member variable during
 // initialization.
-QSizeF PopplerPage::pageSizeF() { return _poppler_page->pageSizeF(); }
+QSizeF PopplerPage::pageSizeF() const {
+  Q_ASSERT(_poppler_page != NULL);
+  return _poppler_page->pageSizeF();
+}
 
 QImage PopplerPage::renderToImage(double xres, double yres, QRect render_box, bool cache)
 {
@@ -356,16 +440,39 @@ QList< QSharedPointer<PDFLinkAnnotation> > PopplerPage::loadLinks()
   QList<Poppler::Annotation *> popplerAnnots = _poppler_page->annotations();
   docLock.unlock();
 
+  // Note: Poppler gives the linkArea in normalized coordinates, i.e., in the
+  // range of 0..1, with y=0 at the top. We use pdf coordinates internally, so
+  // we need to transform things accordingly.
+  QTransform denormalize = QTransform::fromScale(pageSizeF().width(), -pageSizeF().height()).translate(0,  -1);
+
   // Convert poppler links to PDFLinkAnnotations
-  // Note: 
   foreach (Poppler::Link * popplerLink, popplerLinks) {
     QSharedPointer<PDFLinkAnnotation> link(new PDFLinkAnnotation);
-    link->setRect(popplerLink->linkArea());
-    link->setPage(this);
+
+    // Look up the corresponding Poppler::LinkAnnotation object. Do this first
+    // so the general annotation settings can be overridden by more specific
+    // link annotation settings afterwards (if necessary)
+    // Note: Poppler::LinkAnnotation::linkDestionation() [sic] doesn't reliably
+    // return a Poppler::Link*. Therefore, we have to find the correct
+    // annotation object ourselves. Note, though, that boundary() and rect()
+    // don't seem to correspond exactly (i.e., they are neither (necessarily)
+    // equal, nor does one (necessarily) contain the other.
+    // TODO: Can we have the situation that we get more than one matching
+    // annotations out of this?
+    foreach (Poppler::Annotation * popplerAnnot, popplerAnnots) {
+      if (!popplerAnnot || popplerAnnot->subType() != Poppler::Annotation::ALink || !denormalize.mapRect(popplerAnnot->boundary()).intersects(link->rect()))
+        continue;
+
+      Poppler::LinkAnnotation * popplerLinkAnnot = static_cast<Poppler::LinkAnnotation *>(popplerAnnot);
+      convertAnnotation(link.data(), popplerLinkAnnot, this);
+      // TODO: Does Poppler provide an easy interface to all quadPoints?
+      // Note: Poppler::LinkAnnotation::HighlightMode is identical to PDFLinkAnnotation::HighlightingMode
+      link->setHighlightingMode((PDFLinkAnnotation::HighlightingMode)popplerLinkAnnot->linkHighlightMode());
+      break;
+    }
+
+    link->setRect(denormalize.mapRect(popplerLink->linkArea()));
     
-    // FIXME: Actional action/destination
-    //setActionOnActivation(PDFAction * const action);
-    //setDestination(PDFDestination * const destination);
     switch (popplerLink->linkType()) {
       case Poppler::Link::Goto:
         {
@@ -403,30 +510,6 @@ QList< QSharedPointer<PDFLinkAnnotation> > PopplerPage::loadLinks()
         continue;
     }
 
-
-    // Look up the corresponding Poppler::LinkAnnotation object
-    // Note: Poppler::LinkAnnotation::linkDestionation() [sic] doesn't reliably
-    // return a Poppler::Link*. Therefore, we have to find the correct
-    // annotation object ourselves. Note, though, that boundary() and rect()
-    // don't seem to correspond exactly (i.e., they are neither (necessarily)
-    // equal, nor does one (necessarily) contain the other.
-    // TODO: Can we have the situation that we get more than one matching
-    // annotations out of this?
-    foreach (Poppler::Annotation * popplerAnnot, popplerAnnots) {
-      if (!popplerAnnot || popplerAnnot->subType() != Poppler::Annotation::ALink || !popplerAnnot->boundary().intersects(link->rect()))
-        continue;
-      Poppler::LinkAnnotation * popplerLinkAnnot = static_cast<Poppler::LinkAnnotation *>(popplerAnnot);
-      link->setContents(popplerLinkAnnot->contents());
-      link->setName(popplerLinkAnnot->uniqueName());
-      link->setLastModified(popplerLinkAnnot->modificationDate());
-      // TODO: Does poppler provide the color anywhere?
-      // FIXME: Convert flags
-
-      // Note: Poppler::LinkAnnotation::HighlightMode is identical to PDFLinkAnnotation::HighlightingMode
-      link->setHighlightingMode((PDFLinkAnnotation::HighlightingMode)popplerLinkAnnot->linkHighlightMode());
-      // TODO: Does Poppler provide an easy interface to all quadPoints?
-      break;
-    }
     _links << link;
   }
   return _links;
