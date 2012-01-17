@@ -62,18 +62,10 @@ build the project:
 TODO
 ====
 ### Required
- - Ensure temporary "rendering" images are always replaced. Thought this was
-   fixed by e9c7be11df5bfe507585fea889e8b588b4431fff, but the bug is still
-   present.
  - Fix FIXMEs
  - context menu
  - Highlighting! (to show syncing destination, search results, etc.)
- - possibility to abort render requests when page moves out of view (is there a
-   way to avoid going through all pages at each scroll event?)
  - Port scripting-related functions from Tw (if any)
- - Handling of encrypted/password protected files (this needs to be handled
-   during loading; accessing some functions (e.g., for rendering) in a locked
-   document crashes the program)
  - Add a PDFDocumentWidget, derived from PDFDocumentView, which encapsulates the
    scene and provides, e.g., a load() function for ease of use (similar to what
    Qt does, see QTreeView vs. QTreeWidget)
@@ -81,8 +73,15 @@ TODO
    this requires some reconsideration of memory management, as Page object
    could change, which would have to be propagated upwards to every object
    holding a pointer to them (e.g., PDFPageGraphicsItem)
- - Make program translatable; this probably entails creating a (dummy) Qt .pro
-   file so we can use the normal Qt linguist approach
+ - ~~Make program translatable; this probably entails creating a (dummy) Qt .pro
+   file so we can use the normal Qt linguist approach~~ __DONE__
+ - ~~Properly namespace the code~~ __DONE__
+ - ~~Handling of encrypted/password protected files (this needs to be handled
+   during loading; accessing some functions (e.g., for rendering) in a locked
+   document crashes the program)~~ __DONE__
+ - ~~Ensure temporary "rendering" images are always replaced. Thought this was
+   fixed by e9c7be11df5bfe507585fea889e8b588b4431fff, but the bug is still
+   present.~~ __DONE__
  - ~~Possibly simplify page processing request generation. Rational: Right now,
    requestLoadLinks, requestRenderPage, and addPageProcessingRequest are all
    called from the main thread, if I understood threading correctly.
@@ -123,13 +122,16 @@ TODO
  - Speed up magnifier; in Tw, it seems much more responsive. This might be due
    to using centerOn in PDFDocumentMagnifierView::setPosition but needs closer
    investigation
+ - possibility to abort render requests when page moves out of view (is there a
+   way to avoid going through all pages at each scroll event?)
  - annotations (popup window)
  - make the magnifying glass a top-level window (so it can extend outside the
    main view's window boundaries) (requested by Reinhard Kotucha)
  - rulers (in main window, and attached to magnifying glass)
- - or measuring tool
+ - or ~~measuring tool~~ __DONE__
  - Split view???
- - Provide additional info, e.g. through QDockWidget. Annotations, thumbnails (?).
+ - Provide additional info, e.g. through QDockWidget. ~~Annotations,~~
+   thumbnails (?). __STARTED__
  - Printing.
  - Derive zoom icons from Tango instead of from Qt
  - Presentation mode

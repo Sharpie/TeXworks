@@ -27,12 +27,28 @@ IF ( NOT CMAKE_BUILD_TYPE )
   SET(CMAKE_BUILD_TYPE "Debug")
 ENDIF ()
 
-OPTION(WITH_POPPLER "Build Poppler backend" ON)
+# By default, we build a shared lib...
+IF ( NOT DEFINED BUILD_SHARED_LIBS )
+  SET(BUILD_SHARED_LIBS ON)
+ENDIF ()
+
+# ...with poppler...
+IF ( NOT DEFINED WITH_POPPLER )
+  SET(WITH_POPPLER ON)
+ENDIF ()
+
+# ...but without MuPDF
+IF ( NOT DEFINED WITH_MUPDF )
+  SET(WITH_MUPDF OFF)
+ENDIF ()
+
+OPTION(WITH_POPPLER "Build Poppler backend" ${WITH_POPPLER})
 # MuPDF backend is a bit immature, so we don't bother with it by default right
 # now.
-OPTION(WITH_MUPDF "Build MuPDF backend" OFF)
+OPTION(WITH_MUPDF "Build MuPDF backend" ${WITH_MUPDF})
 
 
+OPTION(BUILD_SHARED_LIBS "Build shared library" ${BUILD_SHARED_LIBS})
 
 # Dependency Configuration
 # ========================
@@ -81,7 +97,10 @@ IF( WITH_POPPLER )
 
   FIND_PACKAGE(Poppler REQUIRED)
   LIST(APPEND QTPDF_INCLUDE_DIRS ${POPPLER_QT4_INCLUDE_DIR})
-  LIST(APPEND QTPDF_LIBS ${POPPLER_LIBRARIES})
+  # In case poppler is linked statically, its libs have to be given to the
+  # linker **first** for some strange reason or symbols won't be properly
+  # resolved. At least, this is the case with the MinGW linker.
+  SET(QTPDF_LIBS ${POPPLER_LIBRARIES} ${QTPDF_LIBS})
 
   # The only thing Poppler should need is the location of the include
   # directories in order to access header files. The library loader should be
@@ -150,7 +169,8 @@ INCLUDE_DIRECTORIES(
 )
 
 IF( ${CMAKE_BUILD_TYPE} STREQUAL "Debug" )
-  ADD_DEFINITIONS(-DDEBUG)
+  ADD_DEFINITIONS(-DDEBUG -DQT_NO_CAST_FROM_ASCII -DQT_NO_CAST_TO_ASCII -DQT_NO_CAST_FROM_BYTEARRAY)
+  SET(CMAKE_CXX_FLAGS_DEBUG "-g -Wall")
 ENDIF()
 
 
@@ -158,6 +178,7 @@ ENDIF()
 # -------
 SET(QTPDF_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFDocumentView.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFDocumentTools.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFBackend.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFActions.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFAnnotations.cpp
@@ -165,6 +186,7 @@ SET(QTPDF_SRCS
 
 SET(QTPDF_MOC_HDRS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFDocumentView.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFDocumentTools.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFBackend.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFActions.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFAnnotations.h
@@ -186,9 +208,23 @@ ENDIF()
 
 QT4_WRAP_CPP(QTPDF_MOC ${QTPDF_MOC_HDRS})
 
-ADD_LIBRARY(qtpdf SHARED
+# Create translations
+INCLUDE( TranslationMacros )
+FILE(GLOB TRANSLATIONS_FILES trans/*.ts)
+CREATE_QT4_PRO_FILE("${CMAKE_CURRENT_SOURCE_DIR}/${CMAKE_PROJECT_NAME}.pro" QTPDF_QM ${QTPDF_SRCS} ${QTPDF_MOC_HDRS} ${TRANSLATIONS_FILES})
+
+# Icons
+SET(QTPDF_RCS
+  ${CMAKE_CURRENT_SOURCE_DIR}/QtPDF_icons.qrc
+)
+QT4_ADD_RESOURCES(QTPDF_RESOURCES ${QTPDF_RCS})
+
+
+ADD_LIBRARY(qtpdf
   ${QTPDF_SRCS}
   ${QTPDF_MOC}
+  ${QTPDF_RESOURCES}
+  ${QTPDF_QM}
 )
 
 TARGET_LINK_LIBRARIES(qtpdf ${QTPDF_LIBS})
@@ -297,6 +333,7 @@ message("")
 
 CONFIG_YESNO("Poppler backend" WITH_POPPLER)
 CONFIG_YESNO("MuPDF backend" WITH_MUPDF)
+CONFIG_YESNO("Shared library" BUILD_SHARED_LIBS)
 
 message("")
 message("  Project will be installed to:")

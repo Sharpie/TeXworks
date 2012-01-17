@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2011  Stefan Löffler
+ * Copyright (C) 2011-2012  Stefan Löffler
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -23,7 +23,11 @@
   #include <QDebug>
 #endif
 
-class Document;
+namespace QtPDF {
+
+namespace Backend {
+  class Document;
+}
 
 
 class PDFDestination
@@ -57,7 +61,7 @@ public:
   // Params:
   //  - oldViewport: viewport in old page's coordinate system
   //  - oldZoom
-  QRectF viewport(const Document * doc, const QRectF oldViewport, const float oldZoom) const;
+  QRectF viewport(const Backend::Document * doc, const QRectF oldViewport, const float oldZoom) const;
   
   void setPage(const int page) { _page = page; }
   void setType(const Type type) { _type = type; }
@@ -154,6 +158,7 @@ private:
   bool _newWindow;
 };
 
+} // namespace QtPDF
 
 #endif // End header guard
 // vim: set sw=2 ts=2 et
