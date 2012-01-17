@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2011  Charlie Sharpsteen, Stefan Löffler
+ * Copyright (C) 2011-2012  Charlie Sharpsteen, Stefan Löffler
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -12,6 +12,27 @@
  * more details.
  */
 #include "PDFDocumentView.h"
+
+// This has to be outside the namespace (according to Qt docs)
+static void initResources()
+{
+  Q_INIT_RESOURCE(QtPDF_trans);
+  Q_INIT_RESOURCE(QtPDF_icons);
+}
+
+namespace QtPDF {
+
+// In static builds, we need to explicitly initialize the resources
+// (translations).
+// NOTE: In shared builds, this doesn't seem to hurt.
+class ResourceInitializer
+{
+public:
+  // Call out-of-namespace function in constructor
+  ResourceInitializer() { ::initResources(); }
+};
+ResourceInitializer _resourceInitializer;
+
 #ifdef DEBUG
 #include <QDebug>
 QTime stopwatch;
@@ -24,20 +45,25 @@ static bool isPageItem(const QGraphicsItem *item) { return ( item->type() == PDF
 
 // PDFDocumentView
 // ===============
+QTranslator * PDFDocumentView::_translator = NULL;
+QString PDFDocumentView::_translatorLanguage;
 
 // This class descends from `QGraphicsView` and is responsible for controlling
 // and displaying the contents of a `Document` using a `QGraphicsScene`.
 PDFDocumentView::PDFDocumentView(QWidget *parent):
   Super(parent),
   _pdf_scene(NULL),
-  _useGrayScale(false),
-  _rubberBandOrigin(),
   _zoomLevel(1.0),
+  _useGrayScale(false),
   _pageMode(PageMode_OneColumnContinuous),
   _mouseMode(MouseMode_Move),
-  _armedTool(Tool_None),
-  _activeTool(Tool_None)
+  _armedTool(NULL)
 {
+  initResources();
+  // FIXME: Allow to initialize with a specific language (in case the
+  // application uses a custom locale and switchInterfaceLocale() has not been
+  // called, yet (e.g., this is the first instance of PDFDocumentView that is
+  // created))
   setBackgroundRole(QPalette::Dark);
   setAlignment(Qt::AlignCenter);
   setFocusPolicy(Qt::StrongFocus);
@@ -46,8 +72,15 @@ PDFDocumentView::PDFDocumentView(QWidget *parent):
   // case, `goFirst()` or `goToPage(0)` will fail because the view will think
   // it is already looking at page 0.
   _currentPage = -1;
-  _magnifier = new PDFDocumentMagnifierView(this);
-  _rubberBand = new QRubberBand(QRubberBand::Rectangle, viewport());
+
+  registerTool(new DocumentTool::ZoomIn(this));
+  registerTool(new DocumentTool::ZoomOut(this));
+  registerTool(new DocumentTool::MagnifyingGlass(this));
+  registerTool(new DocumentTool::MarqueeZoom(this));
+  registerTool(new DocumentTool::Move(this));
+  registerTool(new DocumentTool::ContextClick(this));
+  registerTool(new DocumentTool::Measure(this));
+
   // We deliberately set the mouse mode to a different value above so we can
   // call setMouseMode (which bails out if the mouse mode is not changed), which
   // in turn sets up other variables such as _toolAccessors
@@ -86,16 +119,27 @@ void PDFDocumentView::setScene(QSharedPointer<PDFDocumentScene> a_scene)
     // _May want to consider not doing this by default. It is conceivable to have
     // a View that would ignore page jumps that other scenes would respond to._
     connect(_pdf_scene.data(), SIGNAL(pageChangeRequested(int)), this, SLOT(goToPage(int)));
-    connect(_pdf_scene.data(), SIGNAL(pdfActionTriggered(const PDFAction*)), this, SLOT(pdfActionTriggered(const PDFAction*)));
+    connect(_pdf_scene.data(), SIGNAL(pdfActionTriggered(const QtPDF::PDFAction*)), this, SLOT(pdfActionTriggered(const QtPDF::PDFAction*)));
+    connect(_pdf_scene.data(), SIGNAL(documentChanged(const QSharedPointer<QtPDF::Backend::Document>)), this, SIGNAL(changedDocument(const QSharedPointer<QtPDF::Backend::Document>)));
   }
   else
     _lastPage = -1;
+  
+  // ensure the zoom is reset if we load a new document
+  zoom100();
+  
+  // Ensure we're at the top left corner (we need to set _currentPage to -1 to
+  // ensure goFirst() actually does anything even if _currentPage == 0 before.
+  _currentPage = -1;
+  goFirst();
 
   // Ensure search result list is empty in case we are switching from another
   // scene.
   _searchResults.clear();
-  // FIXME: emit some kind of signal to notify other components the scene has
-  // changed (e.g., page number display, dock widgets, etc.)
+  if (_pdf_scene)
+    emit changedDocument(_pdf_scene->document());
+  else
+    emit changedDocument(QSharedPointer<Backend::Document>());
 }
 int PDFDocumentView::currentPage() { return _currentPage; }
 int PDFDocumentView::lastPage()    { return _lastPage; }
@@ -163,7 +207,7 @@ QDockWidget * PDFDocumentView::dockWidget(const Dock type, QWidget * parent /* =
     case Dock_TableOfContents:
     {
       PDFToCInfoWidget * tocWidget = new PDFToCInfoWidget(dock);
-      connect(tocWidget, SIGNAL(actionTriggered(const PDFAction*)), this, SLOT(pdfActionTriggered(const PDFAction*)));
+      connect(tocWidget, SIGNAL(actionTriggered(const QtPDF::PDFAction*)), this, SLOT(pdfActionTriggered(const QtPDF::PDFAction*)));
       infoWidget = tocWidget;
       break;
     }
@@ -176,6 +220,10 @@ QDockWidget * PDFDocumentView::dockWidget(const Dock type, QWidget * parent /* =
     case Dock_Permissions:
       infoWidget = new PDFPermissionsInfoWidget(dock);
       break;
+    case Dock_Annotations:
+      infoWidget = new PDFAnnotationsInfoWidget(dock);
+      // FIXME: possibility to jump to selected/activated annotation
+      break;
     default:
       infoWidget = NULL;
       break;
@@ -187,9 +235,10 @@ QDockWidget * PDFDocumentView::dockWidget(const Dock type, QWidget * parent /* =
   if (_pdf_scene) {
     if (_pdf_scene->document())
       infoWidget->initFromDocument(_pdf_scene->document());
-    connect(_pdf_scene.data(), SIGNAL(documentChanged(const QSharedPointer<Document>)), infoWidget, SLOT(initFromDocument(const QSharedPointer<Document>)));
+    connect(this, SIGNAL(changedDocument(const QSharedPointer<QtPDF::Backend::Document>)), infoWidget, SLOT(initFromDocument(const QSharedPointer<QtPDF::Backend::Document>)));
   }
   dock->setWindowTitle(infoWidget->windowTitle());
+  connect(infoWidget, SIGNAL(windowTitleChanged(const QString &)), dock, SLOT(setWindowTitle(const QString &)));
 
   // We don't want docks to (need to) take up a lot of space. If the infoWidget
   // can't shrink, we thus put it into a scroll area that can
@@ -326,6 +375,26 @@ void PDFDocumentView::zoomFitWidth()
   emit changedZoom(_zoomLevel);
 }
 
+void PDFDocumentView::zoom100()
+{
+  // Reset zoom level to 100%
+
+  // Reset the view scale to 1:1.
+  QRectF unity = matrix().mapRect(QRectF(0, 0, 1, 1));
+  if (unity.isEmpty())
+      return;
+
+  // Set the transformation anchor to AnchorViewCenter so we always zoom out of
+  // the center of the view (rather than out of the upper left corner)
+  QGraphicsView::ViewportAnchor anchor = transformationAnchor();
+  setTransformationAnchor(QGraphicsView::AnchorViewCenter);
+  scale(1 / unity.width(), 1 / unity.height());
+  setTransformationAnchor(anchor);
+
+  _zoomLevel = transform().m11();
+  emit changedZoom(_zoomLevel);
+}
+
 void PDFDocumentView::setMouseMode(const MouseMode newMode)
 {
   if (_mouseMode == newMode)
@@ -333,44 +402,52 @@ void PDFDocumentView::setMouseMode(const MouseMode newMode)
 
   // TODO: eventually make _toolAccessors configurable
   _toolAccessors.clear();
-  _toolAccessors[Qt::ControlModifier + Qt::LeftButton] = Tool_ContextClick;
-  _toolAccessors[Qt::NoModifier + Qt::RightButton] = Tool_ContextMenu;
-  _toolAccessors[Qt::NoModifier + Qt::MiddleButton] = Tool_Move;
-  _toolAccessors[Qt::ShiftModifier + Qt::LeftButton] = Tool_ZoomIn;
-  _toolAccessors[Qt::AltModifier + Qt::LeftButton] = Tool_ZoomOut;
+  _toolAccessors[Qt::ControlModifier + Qt::LeftButton] = getToolByType(DocumentTool::AbstractTool::Tool_ContextClick);
+  _toolAccessors[Qt::NoModifier + Qt::RightButton] = getToolByType(DocumentTool::AbstractTool::Tool_ContextMenu);
+  _toolAccessors[Qt::NoModifier + Qt::MiddleButton] = getToolByType(DocumentTool::AbstractTool::Tool_Move);
+  _toolAccessors[Qt::ShiftModifier + Qt::LeftButton] = getToolByType(DocumentTool::AbstractTool::Tool_ZoomIn);
+  _toolAccessors[Qt::AltModifier + Qt::LeftButton] = getToolByType(DocumentTool::AbstractTool::Tool_ZoomOut);
   // Other tools: Tool_MagnifyingGlass, Tool_MarqueeZoom, Tool_Move
 
-  disarmTool(_armedTool);
+  disarmTool();
+
   switch (newMode) {
     case MouseMode_Move:
-      armTool(Tool_Move);
-      _toolAccessors[Qt::NoModifier + Qt::LeftButton] = Tool_Move;
+      armTool(DocumentTool::AbstractTool::Tool_Move);
+      _toolAccessors[Qt::NoModifier + Qt::LeftButton] = getToolByType(DocumentTool::AbstractTool::Tool_Move);
       break;
 
     case MouseMode_MarqueeZoom:
-      armTool(Tool_MarqueeZoom);
-      _toolAccessors[Qt::NoModifier + Qt::LeftButton] = Tool_MarqueeZoom;
+      armTool(DocumentTool::AbstractTool::Tool_MarqueeZoom);
+      _toolAccessors[Qt::NoModifier + Qt::LeftButton] = getToolByType(DocumentTool::AbstractTool::Tool_MarqueeZoom);
       break;
 
     case MouseMode_MagnifyingGlass:
-      armTool(Tool_MagnifyingGlass);
-      _toolAccessors[Qt::NoModifier + Qt::LeftButton] = Tool_MagnifyingGlass;
+      armTool(DocumentTool::AbstractTool::Tool_MagnifyingGlass);
+      _toolAccessors[Qt::NoModifier + Qt::LeftButton] = getToolByType(DocumentTool::AbstractTool::Tool_MagnifyingGlass);
+      break;
+      
+    case MouseMode_Measure:
+      armTool(DocumentTool::AbstractTool::Tool_Measure);
+      _toolAccessors[Qt::NoModifier + Qt::LeftButton] = getToolByType(DocumentTool::AbstractTool::Tool_Measure);
       break;
   }
 
   _mouseMode = newMode;
 }
 
-void PDFDocumentView::setMagnifierShape(const MagnifierShape shape)
+void PDFDocumentView::setMagnifierShape(const DocumentTool::MagnifyingGlass::MagnifierShape shape)
 {
-  if (_magnifier)
-    _magnifier->setShape(shape);
+  DocumentTool::MagnifyingGlass * magnifier = static_cast<DocumentTool::MagnifyingGlass*>(getToolByType(DocumentTool::AbstractTool::Tool_MagnifyingGlass));
+  if (magnifier)
+    magnifier->setMagnifierShape(shape);
 }
 
 void PDFDocumentView::setMagnifierSize(const int size)
 {
-  if (_magnifier)
-    _magnifier->setSize(size);
+  DocumentTool::MagnifyingGlass * magnifier = static_cast<DocumentTool::MagnifyingGlass*>(getToolByType(DocumentTool::AbstractTool::Tool_MagnifyingGlass));
+  if (magnifier)
+    magnifier->setMagnifierSize(size);
 }
 
 void PDFDocumentView::search(QString searchText)
@@ -396,17 +473,17 @@ void PDFDocumentView::search(QString searchText)
   clearSearchResults();
 
   // Construct a list of requests that can be passed to QtConcurrent::mapped()
-  QList<SearchRequest> requests;
+  QList<Backend::SearchRequest> requests;
   int i;
   for (i = _currentPage; i < _lastPage; ++i) {
-    SearchRequest request;
+    Backend::SearchRequest request;
     request.doc = _pdf_scene->document();
     request.pageNum = i;
     request.searchString = searchText;
     requests << request;
   }
   for (i = 0; i < _currentPage; ++i) {
-    SearchRequest request;
+    Backend::SearchRequest request;
     request.doc = _pdf_scene->document();
     request.pageNum = i;
     request.searchString = searchText;
@@ -422,7 +499,7 @@ void PDFDocumentView::search(QString searchText)
 
   _currentSearchResult = -1;
   _searchString = searchText;
-  _searchResultWatcher.setFuture(QtConcurrent::mapped(requests, Page::search));
+  _searchResultWatcher.setFuture(QtConcurrent::mapped(requests, Backend::Page::search));
 }
 
 void PDFDocumentView::nextSearchResult()
@@ -475,7 +552,7 @@ void PDFDocumentView::searchResultReady(int index)
   QBrush highlightBrush(fillColor);
 
   // Convert the search result to highlight boxes
-  foreach( SearchResult result, _searchResultWatcher.future().resultAt(index) ) {
+  foreach( Backend::SearchResult result, _searchResultWatcher.future().resultAt(index) ) {
     PDFPageGraphicsItem *page = qgraphicsitem_cast<PDFPageGraphicsItem*>(_pdf_scene->pageAt(result.pageNum));
     if (!page)
       continue;
@@ -512,6 +589,16 @@ void PDFDocumentView::maybeUpdateSceneRect() {
   // bars. In single page mode, this must be the rect of the current page
   // **TODO:** Safeguard
   setSceneRect(_pdf_scene->pageAt(_currentPage)->sceneBoundingRect());
+}
+
+void PDFDocumentView::maybeArmTool(uint modifiers)
+{
+  // Arms the tool corresponding to `modifiers` if one is available. 
+  DocumentTool::AbstractTool * t = _toolAccessors.value(modifiers, NULL);
+  if (t != _armedTool) {
+    disarmTool();
+    armTool(t);
+  }
 }
 
 void PDFDocumentView::goToPage(const PDFPageGraphicsItem * page, const int alignment /* = Qt::AlignLeft | Qt::AlignTop */)
@@ -737,6 +824,63 @@ void PDFDocumentView::pdfActionTriggered(const PDFAction * action)
   }
 }
 
+void PDFDocumentView::switchInterfaceLocale(const QLocale & newLocale)
+{
+  // TODO: Allow for a custom directory for .qm files (i.e., one in the
+  // filesystem, instead of the embedded resources)
+  // Avoid (re-)installing the same translator multiple times (e.g., if several
+  // PDFDocumentView objects are used in the same application simultaneously
+  if (_translatorLanguage == newLocale.name())
+    return;
+
+  // Remove the old translator (if any)
+  if (_translator) {
+    QApplication::instance()->removeTranslator(_translator);
+    _translator->deleteLater();
+    _translator = NULL;
+  }
+  
+  _translatorLanguage = newLocale.name();
+  
+  _translator = new QTranslator();
+  if (_translator->load(QString::fromUtf8("QtPDF_%1").arg(newLocale.name()), QString::fromUtf8(":/trans")))
+    QApplication::instance()->installTranslator(_translator);
+  else {
+    _translator->deleteLater();
+    _translator = NULL;
+  }
+}
+
+
+void PDFDocumentView::registerTool(DocumentTool::AbstractTool * tool)
+{
+  int i;
+  
+  if (!tool)
+    return;
+
+  // Remove any identical tools
+  for (i = 0; i < _tools.size(); ++i) {
+    if (_tools[i] && *_tools[i] == *tool) {
+      delete _tools[i];
+      _tools.remove(i);
+      --i;
+    }
+  }
+  // Add the new tool
+  _tools.append(tool);
+}
+
+DocumentTool::AbstractTool* PDFDocumentView::getToolByType(const DocumentTool::AbstractTool::Type type)
+{
+  foreach(DocumentTool::AbstractTool * tool, _tools) {
+    if (tool && tool->type() == type)
+      return tool;
+  }
+  return NULL;
+}
+
+
 
 // Event Handlers
 // --------------
@@ -762,30 +906,21 @@ void PDFDocumentView::paintEvent(QPaintEvent *event)
     }
   }
 
-  // Draw a drop shadow
-  if (_magnifier && _magnifier->isVisible()) {
-    QPainter p(viewport());
-    QPixmap& dropShadow(_magnifier->dropShadow());
-    QRect r(QPoint(0, 0), dropShadow.size());
-    r.moveCenter(_magnifier->geometry().center());
-    p.drawPixmap(r.topLeft(), dropShadow);
-  }
+  if (_armedTool)
+    _armedTool->paintEvent(event);
 }
 
 void PDFDocumentView::keyPressEvent(QKeyEvent *event)
 {
+  // FIXME: No moving while tools are active?
   switch ( event->key() )
   {
     case Qt::Key_Home:
-      if (_activeTool != Tool_None)
-        break;
       goFirst();
       event->accept();
       break;
 
     case Qt::Key_End:
-      if (_activeTool != Tool_None)
-        break;
       goLast();
       event->accept();
       break;
@@ -796,10 +931,6 @@ void PDFDocumentView::keyPressEvent(QKeyEvent *event)
     case Qt::Key_Down:
     case Qt::Key_Left:
     case Qt::Key_Right:
-      // Don't scroll the view while a tool, such as the magnifier, is active.
-      if (_activeTool != Tool_None)
-        break;
-
       // Check to see if we need to jump to the next page in single page mode.
       if ( pageMode() == PageMode_SinglePage ) {
         int scrollStep, scrollPos = verticalScrollBar()->value();
@@ -838,24 +969,25 @@ void PDFDocumentView::keyPressEvent(QKeyEvent *event)
       Super::keyPressEvent(event);
       break;
   }
-  Tool t = _toolAccessors.value(Qt::LeftButton + event->modifiers(), Tool_None);
-  if (_activeTool != t)
-    abortTool(_activeTool);
-  if (_armedTool != t) {
-    disarmTool(_armedTool);
-    armTool(t);
-  }
+  // If we have an armed tool, pass the event on to it
+  // Note: by default, PDFDocumentTool::keyPressEvent() calls maybeArmTool() if
+  // it doesn't handle the event
+  if (_armedTool)
+    _armedTool->keyPressEvent(event);
+  // If there is no currently armed tool, maybe we can arm one now
+  else
+    maybeArmTool(Qt::LeftButton + event->modifiers());
 }
 
 void PDFDocumentView::keyReleaseEvent(QKeyEvent *event)
 {
-  Tool t = _toolAccessors.value(Qt::LeftButton + event->modifiers(), Tool_None);
-  if (_activeTool != t)
-    abortTool(_activeTool);
-  if (_armedTool != t) {
-    disarmTool(_armedTool);
-    armTool(t);
-  }
+  // If we have an armed tool, pass the event on to it
+  // Note: by default, PDFDocumentTool::keyReleaseEvent() calls maybeArmTool() if
+  // it doesn't handle the event
+  if(_armedTool)
+    _armedTool->keyReleaseEvent(event);
+  else
+    maybeArmTool(Qt::LeftButton + event->modifiers());
 }
 
 void PDFDocumentView::mousePressEvent(QMouseEvent * event)
@@ -867,14 +999,18 @@ void PDFDocumentView::mousePressEvent(QMouseEvent * event)
   if (event->isAccepted())
     return;
 
-  Tool t = _toolAccessors.value(event->buttons() | event->modifiers(), Tool_None);
-  if (_armedTool != t) {
-    disarmTool(_armedTool);
-    armTool(t);
-  }
-  if (t != _activeTool)
-    abortTool(_activeTool);
-  startTool(t, event);
+  DocumentTool::AbstractTool * oldArmed = _armedTool;
+  
+  if(_armedTool)
+    _armedTool->mousePressEvent(event);
+  else
+    maybeArmTool(event->buttons() | event->modifiers());
+
+  // This mouse event may have armed a new tool (either explicitly, or because
+  // the previously armed tool passed it on to maybeArmTool). In that case, we
+  // need to pass it on to the newly armed tool
+  if (_armedTool && _armedTool != oldArmed)
+    _armedTool->mousePressEvent(event);
 }
 
 void PDFDocumentView::mouseMoveEvent(QMouseEvent * event)
@@ -882,40 +1018,9 @@ void PDFDocumentView::mouseMoveEvent(QMouseEvent * event)
   // Note: to avoid reverting to _armed == Tool_None when moving the mouse
   // without pressing any button, we arm the default tool (corresponding to the
   // left mouse button) instead in that case
-  Qt::MouseButtons buttons = event->buttons();
-  if (buttons == Qt::NoButton)
-    buttons = Qt::LeftButton;
-  Tool t = _toolAccessors.value(buttons | event->modifiers(), Tool_None);
-  // TODO: This can possibly be simplified by checking if any buttons are
-  // pressed...
-  if (_armedTool != t) {
-    disarmTool(_armedTool);
-    armTool(t);
-  }
-  if (t != _activeTool)
-    abortTool(_activeTool);
 
-  if (_activeTool == Tool_MarqueeZoom) {
-    // Some shortcut values.
-    QPoint o = _rubberBandOrigin, p = event->pos();
-
-    if ( not event->buttons() == Qt::LeftButton ) {
-      // The user somehow let go of the left button without us recieving an
-      // event. Abort the zoom operation.
-      _rubberBand->setGeometry(QRect());
-      _rubberBand->hide();
-    } else if ( (o - p).manhattanLength() > QApplication::startDragDistance() ) {
-      // Update rubber band Geometry.
-      _rubberBand->setGeometry(QRect(
-        QPoint(qMin(o.x(),p.x()), qMin(o.y(), p.y())),
-        QPoint(qMax(o.x(),p.x()), qMax(o.y(), p.y()))
-      ));
-
-      event->accept();
-      return;
-    }
-  }
-
+  if(_armedTool)
+    _armedTool->mouseMoveEvent(event);
   Super::mouseMoveEvent(event);
 
   // We don't check for event->isAccepted() here; for one, this always seems to
@@ -923,31 +1028,6 @@ void PDFDocumentView::mouseMoveEvent(QMouseEvent * event)
   // mouse tracking we only receive this event if the current widget has grabbed
   // the mouse (i.e., after a mousePressEvent and before the corresponding
   // mouseReleaseEvent)
-
-  switch (_activeTool) {
-    case Tool_MagnifyingGlass:
-      if (_magnifier && _magnifier->isVisible()) {
-        _magnifier->setPosition(event->pos());
-        viewport()->update();
-      }
-      break;
-
-    case Tool_Move:
-      // Adapted from <qt>/src/gui/graphicsview/qgraphicsview.cpp @ QGraphicsView::mouseMoveEvent
-      {
-        QScrollBar *hBar = horizontalScrollBar();
-        QScrollBar *vBar = verticalScrollBar();
-        QPoint delta = event->pos() - _movePosition;
-        hBar->setValue(hBar->value() - delta.x());
-        vBar->setValue(vBar->value() - delta.y());
-        _movePosition = event->pos();
-      }
-      break;
-
-    default:
-      // Nothing to do
-      break;
-  }
 }
 
 void PDFDocumentView::mouseReleaseEvent(QMouseEvent * event)
@@ -959,19 +1039,10 @@ void PDFDocumentView::mouseReleaseEvent(QMouseEvent * event)
   // mouse tracking we only receive this event if the current widget has grabbed
   // the mouse (i.e., after a mousePressEvent)
 
-  Qt::MouseButtons buttons = event->buttons();
-  if (buttons == Qt::NoButton)
-    buttons |= Qt::LeftButton;
-
-  Tool t = _toolAccessors.value(buttons | event->modifiers(), Tool_None);
-  if (_armedTool != t) {
-    disarmTool(_armedTool);
-    armTool(t);
-  }
-  if (t != _activeTool)
-    abortTool(_activeTool);
+  if(_armedTool)
+    _armedTool->mouseReleaseEvent(event);
   else
-    finishTool(_activeTool, event);
+    maybeArmTool(event->buttons() | event->modifiers());
 }
 
 void PDFDocumentView::wheelEvent(QWheelEvent * event)
@@ -1013,186 +1084,37 @@ void PDFDocumentView::wheelEvent(QWheelEvent * event)
   Super::wheelEvent(event);
 }
 
-void PDFDocumentView::armTool(const Tool tool)
+void PDFDocumentView::changeEvent(QEvent * event)
+{
+  if (event && event->type() == QEvent::LanguageChange) {
+    if (_pdf_scene)
+      _pdf_scene->retranslateUi();
+  }
+  Super::changeEvent(event);
+}
+
+void PDFDocumentView::armTool(const DocumentTool::AbstractTool::Type toolType)
+{
+  armTool(getToolByType(toolType));
+}
+
+void PDFDocumentView::armTool(DocumentTool::AbstractTool * tool)
 {
   if (_armedTool == tool)
     return;
-
-  // FIXME: Create cursors only once
-  // FIXME: Should separate cursors from the rest of the viewer resources
-  switch (tool) {
-    case Tool_MagnifyingGlass:
-      viewport()->setCursor(QCursor(QPixmap(QString::fromUtf8(":/icons/magnifiercursor.png"))));
-      break;
-    case Tool_ZoomIn:
-      viewport()->setCursor(QCursor(QPixmap(QString::fromUtf8(":/icons/zoomincursor.png"))));
-      break;
-    case Tool_ZoomOut:
-      viewport()->setCursor(QCursor(QPixmap(QString::fromUtf8(":/icons/zoomoutcursor.png"))));
-      break;
-    case Tool_Move:
-      viewport()->setCursor(Qt::OpenHandCursor);
-      break;
-    // FIXME: Mouse cursor for marquee zoom
-    case Tool_MarqueeZoom:
-      viewport()->setCursor(Qt::CrossCursor);
-      break;
-    default:
-      viewport()->unsetCursor();
-      break;
-  }
+  if (_armedTool)
+    disarmTool();
+  if (tool)
+    tool->arm();
   _armedTool = tool;
 }
 
-void PDFDocumentView::startTool(const Tool tool, QMouseEvent * event)
+void PDFDocumentView::disarmTool()
 {
-  switch (tool) {
-    case Tool_MarqueeZoom:
-      // The ideal way to implement marquee zoom would be to set `dragMode` to
-      // `QGraphicsView::RubberBandDrag` and use the rubber band selector
-      // built-in to `QGraphicsView`. However, there is no way to do this and
-      // prevent graphics items, such as links, from responding to the
-      // mouse---hence no way to start a zoom over a link. Calling
-      // `setInteractive(false)` keeps the view from propagating mouse events to
-      // the scene, but it also disables `QGraphicsView::RubberBandDrag`.
-      //
-      // So... we have to do this ourselves.
-      _rubberBandOrigin = event->pos();
-      _rubberBand->setGeometry(QRect());
-      _rubberBand->show();
-      event->accept();
-      break;
-    case Tool_Move:
-      // The ideal way to implement the move tool would be to set `dragMode` to
-      // `QGraphicsView::ScrollHandDrag` and use the built-in functionality.
-      // However, that does work only with the left mouse button.
-      //
-      // So... we have to do this ourselves.
-      viewport()->setCursor(Qt::ClosedHandCursor);
-      _movePosition = event->pos();
-      event->accept();
-      break;
-    case Tool_MagnifyingGlass:
-      _magnifier->prepareToShow();
-      _magnifier->setPosition(event->pos());
-      _magnifier->show();
-
-      // Hide the cursor while the magnifier is active, but save a reference to
-      // the current value so that it can be restored later.
-      _hiddenCursor = viewport()->cursor();
-      viewport()->setCursor(Qt::BlankCursor);
-
-      viewport()->update();
-      event->accept();
-      break;
-    default:
-      // Nothing to do
-      break;
-  }
-  _activeTool = tool;
-}
-
-void PDFDocumentView::finishTool(const Tool tool, QMouseEvent * event)
-{
-  switch (tool) {
-    case Tool_MarqueeZoom:
-      if (_rubberBand->isVisible()) {
-        QRectF zoomRect = mapToScene(_rubberBand->geometry()).boundingRect();
-        _rubberBand->hide();
-        _rubberBand->setGeometry(QRect());
-        zoomToRect(zoomRect);
-        event->accept();
-      }
-      break;
-
-    case Tool_MagnifyingGlass:
-      if (_magnifier && _magnifier->isVisible()) {
-        _magnifier->hide();
-        viewport()->setCursor(_hiddenCursor);
-        viewport()->update();
-        event->accept();
-      }
-      break;
-
-    case Tool_Move:
-      // TODO: Disarming and rearming the current tool is a hack to get the
-      // cursor right if the move tool was accessed through non-standard ways
-      // (e.g., using the middle mouse button)
-      {
-        Tool armedTool = _armedTool;
-        disarmTool(armedTool);
-        armTool(armedTool);
-      }
-      break;
-
-    case Tool_ZoomIn:
-      zoomIn();
-      event->accept();
-      break;
-
-    case Tool_ZoomOut:
-      zoomOut();
-      event->accept();
-      break;
-
-    case Tool_ContextClick:
-      {
-        QPointF pos(mapToScene(event->pos()));
-        QGraphicsItem * item = scene()->itemAt(pos);
-        if (!item || item->type() != PDFPageGraphicsItem::Type)
-          break;
-        PDFPageGraphicsItem * pageItem = static_cast<PDFPageGraphicsItem*>(item);
-        emit contextClick(pageItem->page()->pageNum(), pageItem->mapToPage(pageItem->mapFromScene(pos)));
-        event->accept();
-      }
-      break;
-
-    default:
-      // Nothing to do
-      break;
-  }
-  _activeTool = Tool_None;
-}
-
-void PDFDocumentView::abortTool(const Tool tool)
-{
-  switch (tool) {
-    case Tool_MarqueeZoom:
-      if (_rubberBand->isVisible()) {
-        _rubberBand->hide();
-        _rubberBand->setGeometry(QRect());
-      }
-      break;
-      
-    case Tool_Move:
-      // TODO: Disarming and rearming the current tool is a hack to get the
-      // cursor right if the move tool was accessed through non-standard ways
-      // (e.g., using the middle mouse button)
-      {
-        Tool armedTool = _armedTool;
-        disarmTool(armedTool);
-        armTool(armedTool);
-      }
-      break;
-
-    case Tool_MagnifyingGlass:
-      if (_magnifier && _magnifier->isVisible()) {
-        _magnifier->hide();
-        viewport()->setCursor(_hiddenCursor);
-        viewport()->update();
-      }
-      break;
-    default:
-      // Nothing to do
-      break;
-  }
-  _activeTool = Tool_None;
-}
-
-void PDFDocumentView::disarmTool(const Tool tool)
-{
-  viewport()->unsetCursor();
-  _armedTool = Tool_None;
+  if (!_armedTool)
+    return;
+  _armedTool->disarm();
+  _armedTool = NULL;
 }
 
 
@@ -1204,7 +1126,7 @@ PDFDocumentMagnifierView::PDFDocumentMagnifierView(PDFDocumentView *parent /* = 
   _parent_view(parent),
   _zoomLevel(1.0),
   _zoomFactor(2.0),
-  _shape(PDFDocumentView::Magnifier_Circle),
+  _shape(DocumentTool::MagnifyingGlass::Magnifier_Circle),
   _size(300)
 {
   // the magnifier should initially be hidden
@@ -1259,7 +1181,7 @@ void PDFDocumentMagnifierView::setPosition(const QPoint pos)
   centerOn(_parent_view->mapToScene(pos));
 }
 
-void PDFDocumentMagnifierView::setShape(const PDFDocumentView::MagnifierShape shape)
+void PDFDocumentMagnifierView::setShape(const DocumentTool::MagnifyingGlass::MagnifierShape shape)
 {
   _shape = shape;
 
@@ -1267,7 +1189,7 @@ void PDFDocumentMagnifierView::setShape(const PDFDocumentView::MagnifierShape sh
   setSize(_size);
 
   switch (shape) {
-    case PDFDocumentView::Magnifier_Rectangle:
+    case DocumentTool::MagnifyingGlass::Magnifier_Rectangle:
       clearMask();
 #ifdef Q_WS_MAC
       // On OS X there is a bug that affects masking of QAbstractScrollArea and
@@ -1280,7 +1202,7 @@ void PDFDocumentMagnifierView::setShape(const PDFDocumentView::MagnifierShape sh
       viewport()->clearMask();
 #endif
       break;
-    case PDFDocumentView::Magnifier_Circle:
+    case DocumentTool::MagnifyingGlass::Magnifier_Circle:
       setMask(QRegion(rect(), QRegion::Ellipse));
 #ifdef Q_WS_MAC
       // Hack to fix QTBUG-7150
@@ -1295,10 +1217,10 @@ void PDFDocumentMagnifierView::setSize(const int size)
 {
   _size = size;
   switch (_shape) {
-    case PDFDocumentView::Magnifier_Rectangle:
+    case DocumentTool::MagnifyingGlass::Magnifier_Rectangle:
       setFixedSize(size * 4 / 3, size);
       break;
-    case PDFDocumentView::Magnifier_Circle:
+    case DocumentTool::MagnifyingGlass::Magnifier_Circle:
       setFixedSize(size, size);
       break;
   }
@@ -1324,10 +1246,10 @@ void PDFDocumentMagnifierView::paintEvent(QPaintEvent * event)
 
   painter.setPen(pen);
   switch(_shape) {
-    case PDFDocumentView::Magnifier_Rectangle:
+    case DocumentTool::MagnifyingGlass::Magnifier_Rectangle:
       painter.drawRect(rect);
       break;
-    case PDFDocumentView::Magnifier_Circle:
+    case DocumentTool::MagnifyingGlass::Magnifier_Circle:
       // Ensure we're drawing where we should, regardless how the window system
       // handles masks
       painter.setClipRegion(mask());
@@ -1366,7 +1288,7 @@ QPixmap& PDFDocumentMagnifierView::dropShadow()
   _dropShadow.fill(Qt::transparent);
 
   switch(_shape) {
-    case PDFDocumentView::Magnifier_Rectangle:
+    case DocumentTool::MagnifyingGlass::Magnifier_Rectangle:
       {
         QPainterPath path;
         QRectF boundingRect(_dropShadow.rect().adjusted(0, 0, -1, -1));
@@ -1417,7 +1339,7 @@ QPixmap& PDFDocumentMagnifierView::dropShadow()
         shadow.fillPath(path, gradient);
       }
       break;
-    case PDFDocumentView::Magnifier_Circle:
+    case DocumentTool::MagnifyingGlass::Magnifier_Circle:
       {
         QRadialGradient gradient(QRectF(_dropShadow.rect()).center(), _dropShadow.width() / 2.0, QRectF(_dropShadow.rect()).center());
         QColor color(Qt::black);
@@ -1442,7 +1364,7 @@ QPixmap& PDFDocumentMagnifierView::dropShadow()
 // A large canvas that manages the layout of QGraphicsItem subclasses. The
 // primary items we are concerned with are PDFPageGraphicsItem and
 // PDFLinkGraphicsItem.
-PDFDocumentScene::PDFDocumentScene(Document *a_doc, QObject *parent):
+PDFDocumentScene::PDFDocumentScene(Backend::Document *a_doc, QObject *parent):
   Super(parent),
   _doc(a_doc)
 {
@@ -1453,6 +1375,31 @@ PDFDocumentScene::PDFDocumentScene(Document *a_doc, QObject *parent):
 
   connect(&_pageLayout, SIGNAL(layoutChanged(const QRectF)), this, SLOT(pageLayoutChanged(const QRectF)));
 
+  // Initialize the unlock widget
+  {
+    _unlockWidget = new QWidget();
+    QVBoxLayout * layout = new QVBoxLayout();
+  
+    _unlockWidgetLockIcon = new QLabel(_unlockWidget);
+    _unlockWidgetLockIcon->setPixmap(QPixmap(QString::fromUtf8(":/icons/lock.png")));
+    _unlockWidgetLockText = new QLabel(_unlockWidget);
+    _unlockWidgetUnlockButton = new QPushButton(_unlockWidget);
+    
+    connect(_unlockWidgetUnlockButton, SIGNAL(clicked()), this, SLOT(doUnlockDialog()));
+  
+    layout->addWidget(_unlockWidgetLockIcon);
+    layout->addWidget(_unlockWidgetLockText);
+    layout->addSpacing(20);
+    layout->addWidget(_unlockWidgetUnlockButton);
+  
+    layout->setAlignment(_unlockWidgetLockIcon, Qt::AlignHCenter);
+    layout->setAlignment(_unlockWidgetLockText, Qt::AlignHCenter);
+    layout->setAlignment(_unlockWidgetUnlockButton, Qt::AlignHCenter);
+  
+    _unlockWidget->setLayout(layout);
+    retranslateUi();
+  }
+  
   reinitializeScene();
 }
 
@@ -1460,7 +1407,6 @@ void PDFDocumentScene::handleActionEvent(const PDFActionEvent * action_event)
 {
   if (!action_event || !action_event->action)
     return;
-  const PDFAction * action = action_event->action;
 
   switch (action_event->action->type() )
   {
@@ -1484,7 +1430,7 @@ void PDFDocumentScene::handleActionEvent(const PDFActionEvent * action_event)
 // Accessors
 // ---------
 
-QSharedPointer<Document> PDFDocumentScene::document() { return QSharedPointer<Document>(_doc); }
+QSharedPointer<Backend::Document> PDFDocumentScene::document() { return QSharedPointer<Backend::Document>(_doc); }
 QList<QGraphicsItem*> PDFDocumentScene::pages() { return _pages; };
 
 // Overloaded method that returns all page objects inside a given rectangular
@@ -1579,6 +1525,27 @@ void PDFDocumentScene::doUnlockDialog()
   }
 }
 
+void PDFDocumentScene::retranslateUi()
+{
+  _unlockWidgetLockText->setText(trUtf8("This document is locked. You need a password to open it."));
+  _unlockWidgetUnlockButton->setText(trUtf8("Unlock"));
+  
+  foreach (QGraphicsItem * i, items()) {
+    if (!i)
+      continue;
+    switch (i->type()) {
+    case PDFLinkGraphicsItem::Type:
+    {
+      PDFLinkGraphicsItem * gi = static_cast<PDFLinkGraphicsItem*>(i);
+      gi->retranslateUi();
+    }
+      break;
+    default:
+      break;
+    }
+  }
+}
+
 // Protected Slots
 // --------------
 void PDFDocumentScene::pageLayoutChanged(const QRectF& sceneRect)
@@ -1593,26 +1560,6 @@ void PDFDocumentScene::reinitializeScene()
   _lastPage = _doc->numPages();
   if (_doc->isLocked()) {
     // FIXME: Deactivate "normal" user interaction, e.g., zooming, panning, etc.
-    QWidget * _unlockWidget = new QWidget();
-    QVBoxLayout * layout = new QVBoxLayout();
-
-    QLabel * lockIcon = new QLabel(_unlockWidget);
-    lockIcon->setPixmap(QPixmap(":/icons/lock.png"));
-    QLabel * lockText = new QLabel(tr("This document is locked. You need a password to open it."), _unlockWidget);
-    QPushButton * lockButton = new QPushButton(tr("Unlock"), _unlockWidget);
-
-    connect(lockButton, SIGNAL(clicked()), this, SLOT(doUnlockDialog()));
-
-    layout->addWidget(lockIcon);
-    layout->addWidget(lockText);
-    layout->addSpacing(20);
-    layout->addWidget(lockButton);
-
-    layout->setAlignment(lockIcon, Qt::AlignHCenter);
-    layout->setAlignment(lockText, Qt::AlignHCenter);
-    layout->setAlignment(lockButton, Qt::AlignHCenter);
-
-    _unlockWidget->setLayout(layout);
     addWidget(_unlockWidget);
   }
   else {
@@ -1674,13 +1621,14 @@ void PDFDocumentScene::showAllPages() const
 
 // This class descends from `QGraphicsObject` and implements the on-screen
 // representation of `Page` objects.
-PDFPageGraphicsItem::PDFPageGraphicsItem(QSharedPointer<Page> a_page, QGraphicsItem *parent):
+PDFPageGraphicsItem::PDFPageGraphicsItem(QSharedPointer<Backend::Page> a_page, QGraphicsItem *parent):
   Super(parent),
   _page(a_page),
   _dpiX(QApplication::desktop()->physicalDpiX()),
   _dpiY(QApplication::desktop()->physicalDpiY()),
 
   _linksLoaded(false),
+  _annotationsLoaded(false),
   _zoomLevel(0.0)
 {
   // Create an empty pixmap that is the same size as the PDF page. This
@@ -1737,6 +1685,12 @@ void PDFPageGraphicsItem::paint(QPainter *painter, const QStyleOptionGraphicsIte
   {
     _page->asyncLoadLinks(this);
     _linksLoaded = true;
+  }
+  
+  if (!_annotationsLoaded) {
+    // FIXME: Load annotations asynchronously?
+    addAnnotations(_page->loadAnnotations());
+    _annotationsLoaded = true;
   }
 
   if ( _zoomLevel != scaleFactor )
@@ -1845,16 +1799,16 @@ void PDFPageGraphicsItem::imageToGrayScale(QImage & img)
 bool PDFPageGraphicsItem::event(QEvent *event)
 {
   // Look for callbacks from asynchronous page operations.
-  if( event->type() == PDFLinksLoadedEvent::LinksLoadedEvent ) {
+  if( event->type() == Backend::PDFLinksLoadedEvent::LinksLoadedEvent ) {
     event->accept();
 
     // Cast to a `PDFLinksLoaded` event so we can access the links.
-    const PDFLinksLoadedEvent *links_loaded_event = static_cast<const PDFLinksLoadedEvent*>(event);
+    const Backend::PDFLinksLoadedEvent *links_loaded_event = static_cast<const Backend::PDFLinksLoadedEvent*>(event);
     addLinks(links_loaded_event->links);
 
     return true;
 
-  } else if( event->type() == PDFPageRenderedEvent::PageRenderedEvent ) {
+  } else if( event->type() == Backend::PDFPageRenderedEvent::PageRenderedEvent ) {
     event->accept();
 
     // FIXME: We're sort of misusing the render event here---it contains a copy
@@ -1878,13 +1832,13 @@ bool PDFPageGraphicsItem::event(QEvent *event)
 // `setParentItem` causes the link objects to be added to the scene that owns
 // the page object. `update` is then called to ensure all links are drawn at
 // once.
-void PDFPageGraphicsItem::addLinks(QList< QSharedPointer<PDFLinkAnnotation> > links)
+void PDFPageGraphicsItem::addLinks(QList< QSharedPointer<Annotation::Link> > links)
 {
   PDFLinkGraphicsItem *linkItem;
 #ifdef DEBUG
   stopwatch.start();
 #endif
-  foreach( QSharedPointer<PDFLinkAnnotation> link, links ){
+  foreach( QSharedPointer<Annotation::Link> link, links ){
     linkItem = new PDFLinkGraphicsItem(link);
     // Map the link from pdf coordinates to scene coordinates
     linkItem->setTransform(QTransform::fromTranslate(0, _pageSize.height()).scale(_dpiX / 72., -_dpiY / 72.));
@@ -1892,6 +1846,29 @@ void PDFPageGraphicsItem::addLinks(QList< QSharedPointer<PDFLinkAnnotation> > li
   }
 #ifdef DEBUG
   qDebug() << "Added links in: " << stopwatch.elapsed() << " milliseconds";
+#endif
+
+  update();
+}
+
+void PDFPageGraphicsItem::addAnnotations(QList< QSharedPointer<Annotation::AbstractAnnotation> > annotations)
+{
+  PDFMarkupAnnotationGraphicsItem *markupAnnotItem;
+#ifdef DEBUG
+  stopwatch.start();
+#endif
+  foreach( QSharedPointer<Annotation::AbstractAnnotation> annot, annotations ){
+    // We currently only handle popups
+    if (!annot->isMarkup())
+      continue;
+    QSharedPointer<Annotation::Markup> markupAnnot = annot.staticCast<Annotation::Markup>();
+    markupAnnotItem = new PDFMarkupAnnotationGraphicsItem(markupAnnot);
+    // Map the link from pdf coordinates to scene coordinates
+    markupAnnotItem->setTransform(QTransform::fromTranslate(0, _pageSize.height()).scale(_dpiX / 72., -_dpiY / 72.));
+    markupAnnotItem->setParentItem(this);
+  }
+#ifdef DEBUG
+  qDebug() << "Added annotations in: " << stopwatch.elapsed() << " milliseconds";
 #endif
 
   update();
@@ -1908,7 +1885,7 @@ void PDFPageGraphicsItem::addLinks(QList< QSharedPointer<PDFLinkAnnotation> > li
 //
 //    * Handles tasks such as cursor changes on mouse hover and link activation
 //      on mouse clicks.
-PDFLinkGraphicsItem::PDFLinkGraphicsItem(QSharedPointer<PDFLinkAnnotation> a_link, QGraphicsItem *parent):
+PDFLinkGraphicsItem::PDFLinkGraphicsItem(QSharedPointer<Annotation::Link> a_link, QGraphicsItem *parent):
   Super(parent),
   _link(a_link),
   _activated(false)
@@ -1938,6 +1915,13 @@ PDFLinkGraphicsItem::PDFLinkGraphicsItem(QSharedPointer<PDFLinkAnnotation> a_lin
   setPen(QPen(Qt::transparent));
 #endif
 
+  retranslateUi();
+}
+
+int PDFLinkGraphicsItem::type() const { return Type; }
+
+void PDFLinkGraphicsItem::retranslateUi()
+{
   PDFAction * action = _link->actionOnActivation();
   if (action) {
     // Set some meaningful tooltip to inform the user what the link does
@@ -1950,7 +1934,7 @@ PDFLinkGraphicsItem::PDFLinkGraphicsItem(QSharedPointer<PDFLinkAnnotation> a_lin
       case PDFAction::ActionTypeGoTo:
         {
           PDFGotoAction * actionGoto = static_cast<PDFGotoAction*>(action);
-          setToolTip(PDFDocumentView::trUtf8("<p>Goto page %1</p>").arg(actionGoto->destination().page() + 1));
+          setToolTip(QString::fromUtf8("<p>") + PDFDocumentView::trUtf8("Goto page %1").arg(actionGoto->destination().page() + 1) + QString::fromUtf8("</p>"));
         }
         break;
       case PDFAction::ActionTypeURI:
@@ -1962,7 +1946,7 @@ PDFLinkGraphicsItem::PDFLinkGraphicsItem(QSharedPointer<PDFLinkAnnotation> a_lin
       case PDFAction::ActionTypeLaunch:
         {
           PDFLaunchAction * actionLaunch = static_cast<PDFLaunchAction*>(action);
-          setToolTip(PDFDocumentView::trUtf8("<p>Execute `%1`</p>").arg(actionLaunch->command()));
+          setToolTip(QString::fromUtf8("<p>") + PDFDocumentView::trUtf8("Execute `%1`").arg(actionLaunch->command()) + QString::fromUtf8("</p>"));
         }
         break;
       default:
@@ -1971,8 +1955,6 @@ PDFLinkGraphicsItem::PDFLinkGraphicsItem(QSharedPointer<PDFLinkAnnotation> a_lin
     }
   }
 }
-
-int PDFLinkGraphicsItem::type() const { return Type; }
 
 // Event Handlers
 // --------------
@@ -2019,6 +2001,170 @@ void PDFLinkGraphicsItem::mouseReleaseEvent(QGraphicsSceneMouseEvent *event)
 }
 
 
+// PDFMarkupAnnotationGraphicsItem
+// ===============================
+
+// This class descends from `QGraphicsRectItem` and serves the following
+// functions:
+//
+//    * Provides easy access to the on-screen geometry of a markup annotation.
+//
+//    * Handles tasks such as cursor changes on mouse hover and link activation
+//      on mouse clicks.
+//
+//    * Displays note popups if necessary
+PDFMarkupAnnotationGraphicsItem::PDFMarkupAnnotationGraphicsItem(QSharedPointer<Annotation::Markup> annot, QGraphicsItem *parent):
+  Super(parent),
+  _annot(annot),
+  _activated(false),
+  _popup(NULL)
+{
+  // The area is expressed in "normalized page coordinates", i.e.  values
+  // in the range [0, 1]. The transformation matrix of this item will have to
+  // be adjusted so that links will show up correctly in a graphics view.
+  setRect(_annot->rect());
+
+  // Allows annotations to provide a context-specific cursor when the mouse is
+  // hovering over them.
+  //
+  // **NOTE:** _Requires Qt 4.4 or newer._
+  setAcceptHoverEvents(true);
+
+  // Only left-clicks will trigger the popup (if any).
+  setAcceptedMouseButtons(annot->popup() ? Qt::LeftButton : Qt::NoButton);
+
+#ifdef DEBUG
+  // **TODO:**
+  // _Currently for debugging purposes only so that the annotation area can be
+  // determined visually, but might make a nice option._
+  setPen(QPen(Qt::blue));
+#else
+  // Perhaps there is a way to not draw the outline at all? Might be more
+  // efficient...
+  setPen(QPen(Qt::transparent));
+#endif
+
+  QString tooltip(annot->richContents());
+  // If the text is not already split into paragraphs, we do that here to ensure
+  // proper line folding in the tooltip and hence to avoid very wide tooltips.
+  if (tooltip.indexOf(QString::fromAscii("<p>")) < 0)
+    tooltip = QString::fromAscii("<p>%1</p>").arg(tooltip.replace(QChar::fromAscii('\n'), QString::fromAscii("</p>\n<p>")));
+  setToolTip(tooltip);
+}
+
+int PDFMarkupAnnotationGraphicsItem::type() const { return Type; }
+
+// Event Handlers
+// --------------
+
+// Swap cursor during hover events.
+void PDFMarkupAnnotationGraphicsItem::hoverEnterEvent(QGraphicsSceneHoverEvent *event)
+{
+  if (_annot->popup())
+    setCursor(Qt::PointingHandCursor);
+}
+
+void PDFMarkupAnnotationGraphicsItem::hoverLeaveEvent(QGraphicsSceneHoverEvent *event)
+{
+  if (_annot->popup())
+    unsetCursor();
+}
+
+// Respond to clicks. Limited to left-clicks by `setAcceptedMouseButtons` in
+// this object's constructor.
+void PDFMarkupAnnotationGraphicsItem::mousePressEvent(QGraphicsSceneMouseEvent *event)
+{
+  // Actually opening the popup is handled during a `mouseReleaseEvent` --- but
+  // only if the `_activated` flag is `true`.
+  _activated = true;
+}
+
+void PDFMarkupAnnotationGraphicsItem::mouseReleaseEvent(QGraphicsSceneMouseEvent *event)
+{
+  Q_ASSERT(event != NULL);
+
+  if (!_activated)
+    return;
+  _activated = false;
+  
+  if (!contains(event->pos()) || !_annot)
+    return;
+
+  // Find widget that received this mouse event in the first place
+  // Note: according to the Qt docs, QApplication::widgetAt() can be slow. But
+  // we don't care here, as this is called only once.
+  QWidget * sender = QApplication::widgetAt(event->screenPos());
+
+  if (!sender || !qobject_cast<PDFDocumentView*>(sender->parent()))
+    return;
+  
+  if (_popup) {
+    if (_popup->isVisible())
+      _popup->hide();
+    else {
+      _popup->move(sender->mapFromGlobal(event->screenPos()));
+      _popup->show();
+      _popup->raise();
+      _popup->setFocus();
+    }
+    return;
+  }
+  
+  _popup = new QWidget(sender);
+  
+  QStringList styles;
+  if (_annot->color().isValid()) {
+    QColor c(_annot->color());
+    styles << QString::fromUtf8(".QWidget { background-color: %1; }").arg(c.name());
+    if (qGray(c.rgb()) >= 100)
+      styles << QString::fromUtf8(".QWidget, .QLabel { color: black; }");
+    else
+      styles << QString::fromUtf8(".QWidget, .QLabel { color: white; }");
+  }
+  else {
+    styles << QString::fromUtf8(".QWidget { background-color: %1; }").arg(QApplication::palette().color(QPalette::Window).name());
+      styles << QString::fromUtf8(".QWidget, .QLabel { color: %1; }").arg(QApplication::palette().color(QPalette::Text).name());
+  }
+  _popup->setStyleSheet(styles.join(QString::fromAscii("\n")));
+  QGridLayout * layout = new QGridLayout(_popup);
+  layout->setContentsMargins(2, 2, 2, 5);
+
+  QLabel * subject = new QLabel(QString::fromUtf8("<b>%1</b>").arg(_annot->subject()), _popup);
+  layout->addWidget(subject, 0, 0, 1, -1);
+  QLabel * author = new QLabel(_annot->author(), _popup);
+  layout->addWidget(author, 1, 0, 1, 1);
+  QLabel * date = new QLabel(_annot->creationDate().toString(Qt::DefaultLocaleLongDate), _popup);
+  layout->addWidget(date, 1, 1, 1, 1, Qt::AlignRight);
+  QTextEdit * content = new QTextEdit(_annot->richContents(), _popup);
+  content->setEnabled(false);
+  layout->addWidget(content, 2, 0, 1, -1);
+
+  _popup->setLayout(layout);
+  _popup->move(sender->mapFromGlobal(event->screenPos()));
+  _popup->show();
+  // FIXME: Make popup closable, movable; position it properly (also upon 
+  // zooming!), give some visible indication to which annotation it belongs.
+  // (Probably turn it into a subclass of QWidget, too).
+}
+
+
+// PDFDocumentInfoWidget
+// =====================
+
+void PDFDocumentInfoWidget::setWindowTitle(const QString & windowTitle)
+{
+  QWidget::setWindowTitle(windowTitle);
+  emit windowTitleChanged(windowTitle);
+}
+
+void PDFDocumentInfoWidget::changeEvent(QEvent * event)
+{
+  if (event && event->type() == QEvent::LanguageChange)
+    retranslateUi();
+  QWidget::changeEvent(event);
+}
+
+
 // PDFToCInfoWidget
 // ============
 
@@ -2038,15 +2184,24 @@ PDFToCInfoWidget::PDFToCInfoWidget(QWidget * parent) :
   setLayout(layout);
 }
 
+void PDFToCInfoWidget::retranslateUi()
+{
+  setWindowTitle(PDFDocumentView::trUtf8("Table of Contents"));
+}
+
 PDFToCInfoWidget::~PDFToCInfoWidget()
 {
   clear();
 }
   
-void PDFToCInfoWidget::initFromDocument(const QSharedPointer<Document> doc)
+void PDFToCInfoWidget::initFromDocument(const QSharedPointer<Backend::Document> doc)
 {
   Q_ASSERT(_tree != NULL);
-  const PDFToC data = doc->toc();
+  Q_ASSERT(!doc.isNull());
+
+  PDFDocumentInfoWidget::initFromDocument(doc);
+  
+  const Backend::PDFToC data = doc->toc();
   clear();
   recursiveAddTreeItems(data, _tree->invisibleRootItem());
 }
@@ -2054,15 +2209,23 @@ void PDFToCInfoWidget::initFromDocument(const QSharedPointer<Document> doc)
 void PDFToCInfoWidget::clear()
 {
   Q_ASSERT(_tree != NULL);
+  // make sure that no item is (and can be) selected while we clear the tree
+  // (otherwise clearing it could trigger (numerous) itemSelectionChanged signals)
+  _tree->setSelectionMode(QAbstractItemView::NoSelection);
   recursiveClearTreeItems(_tree->invisibleRootItem());
+  _tree->setSelectionMode(QAbstractItemView::SingleSelection);
 }
 
 void PDFToCInfoWidget::itemSelectionChanged()
 {
   Q_ASSERT(_tree != NULL);
-  // Since the ToC QTreeWidget is in single selection mode, the first element is
-  // the only one.
-  QTreeWidgetItem * item = _tree->selectedItems().first();
+  // Since the ToC QTreeWidget is in single selection mode, we can only get zero
+  // or one selected item(s)
+  
+  QList<QTreeWidgetItem *> selectedItems = _tree->selectedItems();
+  if (selectedItems.count() == 0)
+    return;
+  QTreeWidgetItem * item = selectedItems.first();
   Q_ASSERT(item != NULL);
   // TODO: It might be better to register PDFAction with the QMetaType framework
   // instead of doing casts with (void*).
@@ -2072,15 +2235,15 @@ void PDFToCInfoWidget::itemSelectionChanged()
 }
 
 //static
-void PDFToCInfoWidget::recursiveAddTreeItems(const QList<PDFToCItem> & tocItems, QTreeWidgetItem * parentTreeItem)
+void PDFToCInfoWidget::recursiveAddTreeItems(const QList<Backend::PDFToCItem> & tocItems, QTreeWidgetItem * parentTreeItem)
 {
-  foreach (const PDFToCItem & tocItem, tocItems) {
+  foreach (const Backend::PDFToCItem & tocItem, tocItems) {
     QTreeWidgetItem * treeItem = new QTreeWidgetItem(parentTreeItem, QStringList(tocItem.label()));
     treeItem->setForeground(0, tocItem.color());
     if (tocItem.flags()) {
       QFont font = treeItem->font(0);
-      font.setBold(tocItem.flags().testFlag(PDFToCItem::Flag_Bold));
-      font.setItalic(tocItem.flags().testFlag(PDFToCItem::Flag_Bold));
+      font.setBold(tocItem.flags().testFlag(Backend::PDFToCItem::Flag_Bold));
+      font.setItalic(tocItem.flags().testFlag(Backend::PDFToCItem::Flag_Bold));
       treeItem->setFont(0, font);
     }
     treeItem->setExpanded(tocItem.isOpen());
@@ -2124,7 +2287,6 @@ PDFMetaDataInfoWidget::PDFMetaDataInfoWidget(QWidget * parent) :
   // vLayout ... lays out the group boxes in w
   // layout ... lays out the actual data widgets in groupBox
   QVBoxLayout * vLayout = new QVBoxLayout(this);
-  QGroupBox * groupBox;
   QFormLayout * layout;
 
   // We want the vLayout to set the size of w (which should encompass all child
@@ -2134,109 +2296,133 @@ PDFMetaDataInfoWidget::PDFMetaDataInfoWidget(QWidget * parent) :
   // Set margins to 0 as space is very limited in the sidebar
   vLayout->setContentsMargins(0, 0, 0, 0);
 
+  // NOTE: The labels are initialized in retranslteUi() below
   // The "Document" group box
-  groupBox = new QGroupBox(PDFDocumentView::trUtf8("Document"), this);
-  layout = new QFormLayout(groupBox);
+  _documentGroup = new QGroupBox(this);
+  layout = new QFormLayout(_documentGroup);
 
-  _title = new QLabel(groupBox);
+  _titleLabel = new QLabel(_documentGroup);
+  _title = new QLabel(_documentGroup);
   _title->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-  layout->addRow(PDFDocumentView::trUtf8("Title:"), _title);
+  layout->addRow(_titleLabel, _title);
 
-  _author = new QLabel(groupBox);
+  _authorLabel = new QLabel(_documentGroup);
+  _author = new QLabel(_documentGroup);
   _author->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-  layout->addRow(PDFDocumentView::trUtf8("Author:"), _author);
+  layout->addRow(_authorLabel, _author);
 
-  _subject = new QLabel(groupBox);
+  _subjectLabel = new QLabel(_documentGroup);
+  _subject = new QLabel(_documentGroup);
   _subject->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-  layout->addRow(PDFDocumentView::trUtf8("Subject:"), _subject);
+  layout->addRow(_subjectLabel, _subject);
 
-  _keywords = new QLabel(groupBox);
+  _keywordsLabel = new QLabel(_documentGroup);
+  _keywords = new QLabel(_documentGroup);
   _keywords->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-  layout->addRow(PDFDocumentView::trUtf8("Keywords:"), _keywords);
-
-  groupBox->setLayout(layout);
-  vLayout->addWidget(groupBox);
+  layout->addRow(_keywordsLabel, _keywords);
+  
+  _documentGroup->setLayout(layout);
+  vLayout->addWidget(_documentGroup);
 
   // The "Processing" group box
-  groupBox = new QGroupBox(PDFDocumentView::trUtf8("Processing"), this);
-  layout = new QFormLayout(groupBox);
+  _processingGroup = new QGroupBox(PDFDocumentView::trUtf8("Processing"), this);
+  layout = new QFormLayout(_processingGroup);
 
-  _creator = new QLabel(groupBox);
+  _creatorLabel = new QLabel(_processingGroup);
+  _creator = new QLabel(_processingGroup);
   _creator->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-  layout->addRow(PDFDocumentView::trUtf8("Creator:"), _creator);
+  layout->addRow(_creatorLabel, _creator);
 
-  _producer = new QLabel(groupBox);
+  _producerLabel = new QLabel(_processingGroup);
+  _producer = new QLabel(_processingGroup);
   _producer->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-  layout->addRow(PDFDocumentView::trUtf8("Producer:"), _producer);
+  layout->addRow(_producerLabel, _producer);
 
-  _creationDate = new QLabel(groupBox);
+  _creationDateLabel = new QLabel(_processingGroup);
+  _creationDate = new QLabel(_processingGroup);
   _creationDate->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-  layout->addRow(PDFDocumentView::trUtf8("Creation date:"), _creationDate);
+  layout->addRow(_creationDateLabel, _creationDate);
 
-  _modDate = new QLabel(groupBox);
+  _modDateLabel = new QLabel(_processingGroup);
+  _modDate = new QLabel(_processingGroup);
   _modDate->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-  layout->addRow(PDFDocumentView::trUtf8("Modification date:"), _modDate);
+  layout->addRow(_modDateLabel, _modDate);
 
-  _trapped = new QLabel(groupBox);
+  _trappedLabel = new QLabel(_processingGroup);
+  _trapped = new QLabel(_processingGroup);
   _trapped->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-  layout->addRow(PDFDocumentView::trUtf8("Trapped:"), _trapped);
+  layout->addRow(_trappedLabel, _trapped);
 
-  groupBox->setLayout(layout);
-  vLayout->addWidget(groupBox);
+  _processingGroup->setLayout(layout);
+  vLayout->addWidget(_processingGroup);
 
   // The "Other" group box
-  _other = groupBox = new QGroupBox(PDFDocumentView::trUtf8("Other"), this);
-  layout = new QFormLayout(groupBox);
+  _otherGroup = new QGroupBox(PDFDocumentView::trUtf8("Other"), this);
+  layout = new QFormLayout(_otherGroup);
+  // Hide the "Other" group box unless it has something to display
+  _otherGroup->setVisible(false);
 
   // Note: Items are added to the "Other" box dynamically in
-  // setMetaDataFromDocument()
+  // initFromDocument()
 
-  groupBox->setLayout(layout);
-  vLayout->addWidget(groupBox);
+  _otherGroup->setLayout(layout);
+  vLayout->addWidget(_otherGroup);
 
   setLayout(vLayout);
+  retranslateUi();
 }
 
-void PDFMetaDataInfoWidget::initFromDocument(const QSharedPointer<Document> doc)
+void PDFMetaDataInfoWidget::initFromDocument(const QSharedPointer<Backend::Document> doc)
 {
-  if (!doc) {
+  PDFDocumentInfoWidget::initFromDocument(doc);
+  reload();
+}
+
+void PDFMetaDataInfoWidget::reload()
+{
+  if (!_doc) {
     clear();
     return;
   }
-  _title->setText(doc->title());
-  _author->setText(doc->author());
-  _subject->setText(doc->subject());
-  _keywords->setText(doc->keywords());
-  _creator->setText(doc->creator());
-  _producer->setText(doc->producer());
-  _creationDate->setText(doc->creationDate().toString(Qt::DefaultLocaleLongDate));
-  _modDate->setText(doc->modDate().toString(Qt::DefaultLocaleLongDate));
-  switch (doc->trapped()) {
-    case Document::Trapped_True:
+  _title->setText(_doc->title());
+  _author->setText(_doc->author());
+  _subject->setText(_doc->subject());
+  _keywords->setText(_doc->keywords());
+  _creator->setText(_doc->creator());
+  _producer->setText(_doc->producer());
+  _creationDate->setText(_doc->creationDate().toString(Qt::DefaultLocaleLongDate));
+  _modDate->setText(_doc->modDate().toString(Qt::DefaultLocaleLongDate));
+  switch (_doc->trapped()) {
+    case Backend::Document::Trapped_True:
       _trapped->setText(PDFDocumentView::trUtf8("Yes"));
       break;
-    case Document::Trapped_False:
+    case Backend::Document::Trapped_False:
       _trapped->setText(PDFDocumentView::trUtf8("No"));
       break;
     default:
       _trapped->setText(PDFDocumentView::trUtf8("Unknown"));
       break;
   }
-  QFormLayout * layout = qobject_cast<QFormLayout*>(_other->layout());
+  QFormLayout * layout = qobject_cast<QFormLayout*>(_otherGroup->layout());
   Q_ASSERT(layout != NULL);
 
   // Remove any items there may be
   while (layout->count() > 0) {
     QLayoutItem * child = layout->takeAt(0);
-    if (child)
+    if (child) {
+      if (child->widget())
+        child->widget()->deleteLater();
       delete child;
+    }
   }
   QMap<QString, QString>::const_iterator it;
-  for (it = doc->metaDataOther().constBegin(); it != doc->metaDataOther().constEnd(); ++it) {
-    QLabel * l = new QLabel(it.value(), _other);
+  for (it = _doc->metaDataOther().constBegin(); it != _doc->metaDataOther().constEnd(); ++it) {
+    QLabel * l = new QLabel(it.value(), _otherGroup);
     l->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
     layout->addRow(it.key(), l);
   }
+  // Hide the "Other" group box unless it has something to display
+  _otherGroup->setVisible(layout->count() > 0);
 }
 
 void PDFMetaDataInfoWidget::clear()
@@ -2250,7 +2436,7 @@ void PDFMetaDataInfoWidget::clear()
   _creationDate->setText(QString());
   _modDate->setText(QString());
   _trapped->setText(PDFDocumentView::trUtf8("Unknown"));
-  QFormLayout * layout = qobject_cast<QFormLayout*>(_other->layout());
+  QFormLayout * layout = qobject_cast<QFormLayout*>(_otherGroup->layout());
   Q_ASSERT(layout != NULL);
 
   // Remove any items there may be
@@ -2260,6 +2446,29 @@ void PDFMetaDataInfoWidget::clear()
       delete child;
   }
 }
+
+void PDFMetaDataInfoWidget::retranslateUi()
+{
+  setWindowTitle(PDFDocumentView::trUtf8("Meta Data"));
+  
+  _documentGroup->setTitle(PDFDocumentView::trUtf8("Document"));
+  _titleLabel->setText(PDFDocumentView::trUtf8("Title:"));
+  _authorLabel->setText(PDFDocumentView::trUtf8("Author:"));
+  _subjectLabel->setText(PDFDocumentView::trUtf8("Subject:"));
+  _keywordsLabel->setText(PDFDocumentView::trUtf8("Keywords:"));
+  
+  _processingGroup->setTitle(PDFDocumentView::trUtf8("Processing"));
+  _creatorLabel->setText(PDFDocumentView::trUtf8("Creator:"));
+  _producerLabel->setText(PDFDocumentView::trUtf8("Producer:"));
+  _creationDateLabel->setText(PDFDocumentView::trUtf8("Creation date:"));
+  _modDateLabel->setText(PDFDocumentView::trUtf8("Modification date:"));
+  _trappedLabel->setText(PDFDocumentView::trUtf8("Trapped:"));
+
+  _otherGroup->setTitle(PDFDocumentView::trUtf8("Other"));
+  
+  reload();
+}
+
 
 // PDFFontsInfoWidget
 // ============
@@ -2276,7 +2485,6 @@ PDFFontsInfoWidget::PDFFontsInfoWidget(QWidget * parent) :
   _table->setFont(f);
 #endif
   _table->setColumnCount(4);
-  _table->setHorizontalHeaderLabels(QStringList() << PDFDocumentView::trUtf8("Name") << PDFDocumentView::trUtf8("Type") << PDFDocumentView::trUtf8("Subset") << PDFDocumentView::trUtf8("Source"));
   _table->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
   _table->setEditTriggers(QAbstractItemView::NoEditTriggers);
   _table->setAlternatingRowColors(true);
@@ -2288,48 +2496,55 @@ PDFFontsInfoWidget::PDFFontsInfoWidget(QWidget * parent) :
 
   layout->addWidget(_table);
   setLayout(layout);
+  retranslateUi();
 }
 
-void PDFFontsInfoWidget::initFromDocument(const QSharedPointer<Document> doc)
+void PDFFontsInfoWidget::initFromDocument(const QSharedPointer<Backend::Document> doc)
+{
+  PDFDocumentInfoWidget::initFromDocument(doc);
+  reload();
+}
+
+void PDFFontsInfoWidget::reload()
 {
   Q_ASSERT(_table != NULL);
 
   clear();
-  if (!doc)
+  if (!_doc)
     return;
 
-  QList<PDFFontInfo> fonts = doc->fonts();
+  QList<Backend::PDFFontInfo> fonts = _doc->fonts();
   _table->setRowCount(fonts.count());
 
   int i = 0;
-  foreach (PDFFontInfo font, fonts) {
+  foreach (Backend::PDFFontInfo font, fonts) {
     _table->setItem(i, 0, new QTableWidgetItem(font.descriptor().pureName()));
     switch (font.fontType()) {
-      case PDFFontInfo::FontType_Type0:
+      case Backend::PDFFontInfo::FontType_Type0:
         _table->setItem(i, 1, new QTableWidgetItem(PDFDocumentView::trUtf8("Type 0")));
         break;
-      case PDFFontInfo::FontType_Type1:
+      case Backend::PDFFontInfo::FontType_Type1:
         _table->setItem(i, 1, new QTableWidgetItem(PDFDocumentView::trUtf8("Type 1")));
         break;
-      case PDFFontInfo::FontType_MMType1:
+      case Backend::PDFFontInfo::FontType_MMType1:
         _table->setItem(i, 1, new QTableWidgetItem(PDFDocumentView::trUtf8("Type 1 (multiple master)")));
         break;
-      case PDFFontInfo::FontType_Type3:
+      case Backend::PDFFontInfo::FontType_Type3:
         _table->setItem(i, 1, new QTableWidgetItem(PDFDocumentView::trUtf8("Type 3")));
         break;
-      case PDFFontInfo::FontType_TrueType:
+      case Backend::PDFFontInfo::FontType_TrueType:
         _table->setItem(i, 1, new QTableWidgetItem(PDFDocumentView::trUtf8("TrueType")));
         break;
     }
     _table->setItem(i, 2, new QTableWidgetItem(font.isSubset() ? PDFDocumentView::trUtf8("yes") : PDFDocumentView::trUtf8("no")));
     switch (font.source()) {
-      case PDFFontInfo::Source_Embedded:
+      case Backend::PDFFontInfo::Source_Embedded:
         _table->setItem(i, 3, new QTableWidgetItem(PDFDocumentView::trUtf8("[embedded]")));
         break;
-      case PDFFontInfo::Source_Builtin:
+      case Backend::PDFFontInfo::Source_Builtin:
         _table->setItem(i, 3, new QTableWidgetItem(PDFDocumentView::trUtf8("[builtin]")));
         break;
-      case PDFFontInfo::Source_File:
+      case Backend::PDFFontInfo::Source_File:
         _table->setItem(i, 3, new QTableWidgetItem(font.fileName().canonicalFilePath()));
         break;
     }
@@ -2342,8 +2557,17 @@ void PDFFontsInfoWidget::initFromDocument(const QSharedPointer<Document> doc)
 
 void PDFFontsInfoWidget::clear()
 {
+  Q_ASSERT(_table != NULL);
   _table->clearContents();
   _table->setRowCount(0);
+}
+
+void PDFFontsInfoWidget::retranslateUi()
+{
+  Q_ASSERT(_table != NULL);
+  setWindowTitle(PDFDocumentView::trUtf8("Fonts"));
+  _table->setHorizontalHeaderLabels(QStringList() << PDFDocumentView::trUtf8("Name") << PDFDocumentView::trUtf8("Type") << PDFDocumentView::trUtf8("Subset") << PDFDocumentView::trUtf8("Source"));  
+  reload();
 }
 
 
@@ -2360,32 +2584,44 @@ PDFPermissionsInfoWidget::PDFPermissionsInfoWidget(QWidget * parent) :
   // widgets completely, since we in turn put it into scrollArea to handle
   // oversized children
   layout->setSizeConstraint(QLayout::SetFixedSize);
-
+  
+  _printLabel = new QLabel(this);
   _print = new QLabel(this);
-  layout->addRow(PDFDocumentView::trUtf8("Printing:"), _print);
+  layout->addRow(_printLabel, _print);
+  _modifyLabel = new QLabel(this);
   _modify = new QLabel(this);
-  layout->addRow(PDFDocumentView::trUtf8("Modifications:"), _modify);
+  layout->addRow(_modifyLabel, _modify);
+  _extractLabel = new QLabel(this);
   _extract = new QLabel(this);
-  layout->addRow(PDFDocumentView::trUtf8("Extraction:"), _extract);
+  layout->addRow(_extractLabel, _extract);
+  _addNotesLabel = new QLabel(this);
   _addNotes = new QLabel(this);
-  layout->addRow(PDFDocumentView::trUtf8("Annotation:"), _addNotes);
+  layout->addRow(_addNotesLabel, _addNotes);
+  _formLabel = new QLabel(this);
   _form = new QLabel(this);
-  layout->addRow(PDFDocumentView::trUtf8("Filling forms:"), _form);
+  layout->addRow(_formLabel, _form);
 
   setLayout(layout);
+  retranslateUi();
 }
 
-void PDFPermissionsInfoWidget::initFromDocument(const QSharedPointer<Document> doc)
+void PDFPermissionsInfoWidget::initFromDocument(const QSharedPointer<Backend::Document> doc)
 {
-  if (!doc) {
+  PDFDocumentInfoWidget::initFromDocument(doc);
+  reload();
+}
+
+void PDFPermissionsInfoWidget::reload()
+{
+  if (!_doc) {
     clear();
     return;
   }
   
-  QFlags<Document::Permissions> & perm = doc->permissions();
+  QFlags<Backend::Document::Permissions> & perm = _doc->permissions();
   
-  if (perm.testFlag(Document::Permission_Print)) {
-    if (perm.testFlag(Document::Permission_PrintHighRes))
+  if (perm.testFlag(Backend::Document::Permission_Print)) {
+    if (perm.testFlag(Backend::Document::Permission_PrintHighRes))
       _print->setText(PDFDocumentView::trUtf8("Allowed"));
     else
       _print->setText(PDFDocumentView::trUtf8("Low resolution only"));
@@ -2394,28 +2630,28 @@ void PDFPermissionsInfoWidget::initFromDocument(const QSharedPointer<Document> d
     _print->setText(PDFDocumentView::trUtf8("Denied"));
 
   _modify->setToolTip(QString());
-  if (perm.testFlag(Document::Permission_Change))
+  if (perm.testFlag(Backend::Document::Permission_Change))
     _modify->setText(PDFDocumentView::trUtf8("Allowed"));
-  else if (perm.testFlag(Document::Permission_Assemble)) {
+  else if (perm.testFlag(Backend::Document::Permission_Assemble)) {
     _modify->setText(PDFDocumentView::trUtf8("Assembling only"));
     _modify->setToolTip(PDFDocumentView::trUtf8("Insert, rotate, or delete pages and create bookmarks or thumbnail images"));
   }
   else
     _modify->setText(PDFDocumentView::trUtf8("Denied"));
 
-  if (perm.testFlag(Document::Permission_Extract))
+  if (perm.testFlag(Backend::Document::Permission_Extract))
     _extract->setText(PDFDocumentView::trUtf8("Allowed"));
-  else if (perm.testFlag(Document::Permission_ExtractForAccessibility))
+  else if (perm.testFlag(Backend::Document::Permission_ExtractForAccessibility))
     _extract->setText(PDFDocumentView::trUtf8("Accessibility support only"));
   else
     _extract->setText(PDFDocumentView::trUtf8("Denied"));
 
-  if (perm.testFlag(Document::Permission_Annotate))
+  if (perm.testFlag(Backend::Document::Permission_Annotate))
     _addNotes->setText(PDFDocumentView::trUtf8("Allowed"));
   else
     _addNotes->setText(PDFDocumentView::trUtf8("Denied"));
 
-  if (perm.testFlag(Document::Permission_FillForm))
+  if (perm.testFlag(Backend::Document::Permission_FillForm))
     _form->setText(PDFDocumentView::trUtf8("Allowed"));
   else
     _form->setText(PDFDocumentView::trUtf8("Denied"));
@@ -2428,6 +2664,118 @@ void PDFPermissionsInfoWidget::clear()
   _extract->setText(PDFDocumentView::trUtf8("Denied"));
   _addNotes->setText(PDFDocumentView::trUtf8("Denied"));
   _form->setText(PDFDocumentView::trUtf8("Denied"));
+}
+
+void PDFPermissionsInfoWidget::retranslateUi()
+{
+  setWindowTitle(PDFDocumentView::trUtf8("Permissions"));
+
+  _printLabel->setText(PDFDocumentView::trUtf8("Printing:"));
+  _modifyLabel->setText(PDFDocumentView::trUtf8("Modifications:"));
+  _extractLabel->setText(PDFDocumentView::trUtf8("Extraction:"));
+  _addNotesLabel->setText(PDFDocumentView::trUtf8("Annotation:"));
+  _formLabel->setText(PDFDocumentView::trUtf8("Filling forms:"));
+  reload();
+}
+
+
+// PDFAnnotationsInfoWidget
+// ============
+PDFAnnotationsInfoWidget::PDFAnnotationsInfoWidget(QWidget * parent) :
+  PDFDocumentInfoWidget(parent, PDFDocumentView::trUtf8("Annotations"))
+{
+  QVBoxLayout * layout = new QVBoxLayout(this);
+  layout->setContentsMargins(0, 0, 0, 0);
+  _table = new QTableWidget(this);
+
+#ifdef Q_WS_MAC /* don't do this on windows, as the font ends up too small */
+  QFont f(_table->font());
+  f.setPointSize(f.pointSize() - 2);
+  _table->setFont(f);
+#endif
+  _table->setColumnCount(4);
+  _table->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+  _table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  _table->setAlternatingRowColors(true);
+  _table->setShowGrid(false);
+  _table->setSelectionBehavior(QAbstractItemView::SelectRows);
+  _table->verticalHeader()->hide();
+  _table->horizontalHeader()->setStretchLastSection(true);
+  _table->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft);
+
+  layout->addWidget(_table);
+  setLayout(layout);
+  
+  connect(&_annotWatcher, SIGNAL(resultReadyAt(int)), this, SLOT(annotationsReady(int)));
+  retranslateUi();
+}
+
+void PDFAnnotationsInfoWidget::initFromDocument(const QSharedPointer<Backend::Document> doc)
+{
+  if (!doc)
+    return;
+
+  QList< QSharedPointer<Backend::Page> > pages;
+  int i;
+  for (i = 0; i < doc->numPages(); ++i) {
+    QSharedPointer<Backend::Page> page = doc->page(i);
+    if (page)
+      pages << page;
+  }
+  
+  // If another search is still running, cancel it---after all, the user wants
+  // to perform a new search
+  if (!_annotWatcher.isFinished()) {
+    _annotWatcher.cancel();
+    _annotWatcher.waitForFinished();
+  }
+
+  clear();
+  _annotWatcher.setFuture(QtConcurrent::mapped(pages, PDFAnnotationsInfoWidget::loadAnnotations));
+}
+
+//static
+QList< QSharedPointer<Annotation::AbstractAnnotation> > PDFAnnotationsInfoWidget::loadAnnotations(QSharedPointer<Backend::Page> page)
+{
+  if (!page)
+    return QList< QSharedPointer<Annotation::AbstractAnnotation> >();
+  return page->loadAnnotations();
+}
+
+void PDFAnnotationsInfoWidget::annotationsReady(int index)
+{
+  Q_ASSERT(_table != NULL);
+  int i;
+  
+  i = _table->rowCount();
+  _table->setRowCount(i + _annotWatcher.resultAt(index).count());
+
+
+  foreach(QSharedPointer<Annotation::AbstractAnnotation> pdfAnnot, _annotWatcher.resultAt(index)) {
+    // we only use valid markup annotation here
+    if (!pdfAnnot || !pdfAnnot->isMarkup())
+      continue;
+    Annotation::Markup * annot = static_cast<Annotation::Markup*>(pdfAnnot.data());
+    if (annot->page())
+      _table->setItem(i, 0, new QTableWidgetItem(QString::number(annot->page()->pageNum() + 1)));
+    _table->setItem(i, 1, new QTableWidgetItem(annot->subject()));
+    _table->setItem(i, 2, new QTableWidgetItem(annot->author()));
+    _table->setItem(i, 3, new QTableWidgetItem(annot->contents()));
+    ++i;
+  }
+  _table->setRowCount(i);
+}
+
+void PDFAnnotationsInfoWidget::clear()
+{
+  _table->clearContents();
+  _table->setRowCount(0);
+}
+
+void PDFAnnotationsInfoWidget::retranslateUi()
+{
+  setWindowTitle(PDFDocumentView::trUtf8("Annotations"));
+  _table->setHorizontalHeaderLabels(QStringList() << PDFDocumentView::trUtf8("Page") << PDFDocumentView::trUtf8("Subject") << PDFDocumentView::trUtf8("Author") << PDFDocumentView::trUtf8("Contents"));
 }
 
 
@@ -2733,6 +3081,7 @@ void PDFPageLayout::rearrange() {
   }
 }
 
+} // namespace QtPDF
 
 // vim: set sw=2 ts=2 et
 

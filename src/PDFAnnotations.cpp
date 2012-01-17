@@ -14,16 +14,34 @@
 #include <PDFAnnotations.h>
 #include <PDFBackend.h>
 
+namespace QtPDF {
+
+namespace Annotation {
+
 // Annotations
 // =================
 
-PDFLinkAnnotation::~PDFLinkAnnotation()
+Markup::~Markup()
+{
+  if (_popup)
+    delete _popup;
+}
+
+void Markup::setPopup(Popup * popup)
+{
+  if (_popup)
+    delete _popup;
+  _popup = popup;
+}
+
+
+Link::~Link()
 {
   if (_actionOnActivation)
     delete _actionOnActivation;
 }
 
-QPolygonF PDFLinkAnnotation::quadPoints() const
+QPolygonF Link::quadPoints() const
 {
   if (_quadPoints.isEmpty())
     return QPolygonF(rect());
@@ -36,13 +54,16 @@ QPolygonF PDFLinkAnnotation::quadPoints() const
   return _quadPoints;
 }
 
-void PDFLinkAnnotation::setActionOnActivation(PDFAction * const action)
+void Link::setActionOnActivation(PDFAction * const action)
 {
   if (_actionOnActivation)
     delete _actionOnActivation;
   _actionOnActivation = action;
 }
 
+} // namespace Annotation
+
+} // namespace QtPDF
 
 // vim: set sw=2 ts=2 et
 

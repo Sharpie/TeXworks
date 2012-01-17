@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2011  Charlie Sharpsteen, Stefan Löffler
+ * Copyright (C) 2011-2012  Charlie Sharpsteen, Stefan Löffler
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -27,13 +27,19 @@ extern "C"
 #include <mupdf.h>
 }
 
-class MuPDFDocument;
-class MuPDFPage;
+namespace QtPDF {
 
-class MuPDFDocument: public Document
+namespace Backend {
+
+namespace MuPDF {
+
+class Document;
+class Page;
+
+class Document: public Backend::Document
 {
-  typedef Document Super;
-  friend class MuPDFPage;
+  typedef Backend::Document Super;
+  friend class Page;
 
   void recursiveConvertToC(QList<PDFToCItem> & items, pdf_outline * node) const;
 
@@ -46,8 +52,8 @@ protected:
   void loadMetaData();
 
 public:
-  MuPDFDocument(QString fileName);
-  ~MuPDFDocument();
+  Document(QString fileName);
+  ~Document();
 
   bool isValid() const { return (_mupdf_data != NULL); }
   bool isLocked() const { return (isValid() && _permissionLevel == PermissionLevel_Locked); }
@@ -55,7 +61,7 @@ public:
   bool unlock(const QString password);
   void reload();
 
-  QSharedPointer<Page> page(int at);
+  QSharedPointer<Backend::Page> page(int at);
   PDFDestination resolveDestination(const PDFDestination & namedDestination) const;
 
   PDFToC toc() const;
@@ -71,9 +77,9 @@ private:
 };
 
 
-class MuPDFPage: public Page
+class Page: public Backend::Page
 {
-  typedef Page Super;
+  typedef Backend::Page Super;
 
   // The `fz_display_list` is the main MuPDF object that represents the parsed
   // contents of a Page.
@@ -84,22 +90,30 @@ class MuPDFPage: public Page
   QSizeF _size;
   qreal _rotate;
 
-  QList< QSharedPointer<PDFLinkAnnotation> > _links;
+  QList< QSharedPointer<Annotation::AbstractAnnotation> > _annotations;
+  QList< QSharedPointer<Annotation::Link> > _links;
+  bool _annotationsLoaded;
   bool _linksLoaded;
 
 public:
-  MuPDFPage(MuPDFDocument *parent, int at);
-  ~MuPDFPage();
+  Page(Document *parent, int at);
+  ~Page();
 
   QSizeF pageSizeF() const;
 
   QImage renderToImage(double xres, double yres, QRect render_box = QRect(), bool cache = false);
 
-  QList< QSharedPointer<PDFLinkAnnotation> > loadLinks();
+  QList< QSharedPointer<Annotation::Link> > loadLinks();
+  QList< QSharedPointer<Annotation::AbstractAnnotation> > loadAnnotations();
 
   QList<SearchResult> search(QString searchText);
 };
 
+} // namespace MuPDF
+
+} // namespace Backend
+
+} // namespace QtPDF
 
 #endif // End header guard
 // vim: set sw=2 ts=2 et

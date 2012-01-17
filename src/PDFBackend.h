@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2011  Charlie Sharpsteen, Stefan Löffler
+ * Copyright (C) 2011-2012  Charlie Sharpsteen, Stefan Löffler
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -26,7 +26,11 @@
 #include <QReadWriteLock>
 #include <QWaitCondition>
 #include <QEvent>
+#include <QMap>
 
+namespace QtPDF {
+
+namespace Backend {
 
 // Backend Rendering
 // =================
@@ -216,8 +220,10 @@ public:
   QObject *listener;
   
   virtual bool operator==(const PageProcessingRequest & r) const;
+#ifdef DEBUG
+  virtual operator QString() const = 0;
+#endif
 };
-
 
 class PageProcessingRenderPageRequest : public PageProcessingRequest
 {
@@ -234,6 +240,9 @@ public:
   Type type() const { return PageRendering; }
 
   virtual bool operator==(const PageProcessingRequest & r) const;
+#ifdef DEBUG
+  virtual operator QString() const;
+#endif
 
 protected:
   bool execute();
@@ -273,6 +282,10 @@ public:
   PageProcessingLoadLinksRequest(Page *page, QObject *listener) : PageProcessingRequest(page, listener) { }
   Type type() const { return LoadLinks; }
 
+#ifdef DEBUG
+  virtual operator QString() const;
+#endif
+
 protected:
   bool execute();
 };
@@ -282,14 +295,14 @@ class PDFLinksLoadedEvent : public QEvent
 {
 
 public:
-  PDFLinksLoadedEvent(const QList< QSharedPointer<PDFLinkAnnotation> > links):
+  PDFLinksLoadedEvent(const QList< QSharedPointer<Annotation::Link> > links):
     QEvent(LinksLoadedEvent),
     links(links)
   {}
 
   static const QEvent::Type LinksLoadedEvent;
 
-  const QList< QSharedPointer<PDFLinkAnnotation> > links;
+  const QList< QSharedPointer<Annotation::Link> > links;
 
 };
 
@@ -320,6 +333,7 @@ private:
   bool _quit;
 #ifdef DEBUG
   QTime _renderTimer;
+  static void dumpWorkStack(const QStack<PageProcessingRequest*> & ws);
 #endif
 
 };
@@ -365,14 +379,14 @@ protected:
 
 typedef QList<PDFToCItem> PDFToC;
 
-struct  SearchRequest
+struct SearchRequest
 {
   QSharedPointer<Document> doc;
   int pageNum;
   QString searchString;
 };
 
-struct  SearchResult
+struct SearchResult
 {
   int pageNum;
   QRectF bbox;
@@ -495,7 +509,7 @@ public:
   virtual QImage renderToImage(double xres, double yres, QRect render_box = QRect(), bool cache = false)=0;
   virtual void asyncRenderToImage(QObject *listener, double xres, double yres, QRect render_box = QRect(), bool cache = false);
 
-  virtual QList< QSharedPointer<PDFLinkAnnotation> > loadLinks() = 0;
+  virtual QList< QSharedPointer<Annotation::Link> > loadLinks() = 0;
   virtual void asyncLoadLinks(QObject *listener);
 
   QSharedPointer<QImage> getCachedImage(double xres, double yres, QRect render_box = QRect());
@@ -506,6 +520,7 @@ public:
   // the result.
   QSharedPointer<QImage> getTileImage(QObject * listener, const double xres, const double yres, QRect render_box = QRect());
 
+  virtual QList< QSharedPointer<Annotation::AbstractAnnotation> > loadAnnotations() { return QList< QSharedPointer<Annotation::AbstractAnnotation> >(); }
 
   // Searches the page for the given text string and returns a list of boxes
   // that contain that text.
@@ -525,11 +540,17 @@ public:
   static QList<SearchResult> search(SearchRequest request);
 };
 
+} // namespace Backend
+
+} // namespace QtPDF
 
 // Backend Implementations
 // =======================
 // These provide library-specific concrete impelemntations of the abstract base
 // classes defined here.
+// NOTE: The backend implementations must be included _outside_ the namespace,
+// as that could otherwise interfere with other header files (e.g., those of
+// poppler-qt4)
 #ifdef USE_POPPLER
 #include <backends/PopplerBackend.h> // Invokes GPL v2+ License
 #endif

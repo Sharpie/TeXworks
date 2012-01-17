@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2011  Charlie Sharpsteen, Stefan Löffler
+ * Copyright (C) 2011-2012  Charlie Sharpsteen, Stefan Löffler
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -23,15 +23,21 @@
 
 #include <poppler/qt4/poppler-qt4.h>
 
-class PopplerDocument;
-class PopplerPage;
+namespace QtPDF {
 
-class PopplerDocument: public Document
+namespace Backend {
+
+namespace Poppler {
+
+class Document;
+class Page;
+
+class Document: public Backend::Document
 {
-  typedef Document Super;
-  friend class PopplerPage;
+  typedef Backend::Document Super;
+  friend class Page;
 
-  QSharedPointer<Poppler::Document> _poppler_doc;
+  QSharedPointer< ::Poppler::Document > _poppler_doc;
 
   void recursiveConvertToC(QList<PDFToCItem> & items, QDomNode node) const;
 
@@ -39,17 +45,19 @@ protected:
   // Poppler is not threadsafe, so some operations need to be serialized with a
   // mutex.
   QMutex *_doc_lock;
+  QList<PDFFontInfo> _fonts;
+  bool _fontsLoaded;
 
 public:
-  PopplerDocument(QString fileName);
-  ~PopplerDocument();
+  Document(QString fileName);
+  ~Document();
 
   bool isValid() const { return (_poppler_doc != NULL); }
   bool isLocked() const { return (_poppler_doc ? _poppler_doc->isLocked() : false); }
 
   bool unlock(const QString password);
 
-  QSharedPointer<Page> page(int at);
+  QSharedPointer<Backend::Page> page(int at);
   PDFDestination resolveDestination(const PDFDestination & namedDestination) const;
 
   PDFToC toc() const;
@@ -60,26 +68,34 @@ private:
 };
 
 
-class PopplerPage: public Page
+class Page: public Backend::Page
 {
-  typedef Page Super;
-  QSharedPointer<Poppler::Page> _poppler_page;
-  QList< QSharedPointer<PDFLinkAnnotation> > _links;
+  typedef Backend::Page Super;
+  QSharedPointer< ::Poppler::Page > _poppler_page;
+  QList< QSharedPointer<Annotation::AbstractAnnotation> > _annotations;
+  QList< QSharedPointer<Annotation::Link> > _links;
+  bool _annotationsLoaded;
   bool _linksLoaded;
 
 public:
-  PopplerPage(PopplerDocument *parent, int at);
-  ~PopplerPage();
+  Page(Document *parent, int at);
+  ~Page();
 
   QSizeF pageSizeF() const;
 
   QImage renderToImage(double xres, double yres, QRect render_box = QRect(), bool cache = false);
 
-  QList< QSharedPointer<PDFLinkAnnotation> > loadLinks();
+  QList< QSharedPointer<Annotation::Link> > loadLinks();
+  QList< QSharedPointer<Annotation::AbstractAnnotation> > loadAnnotations();
 
-  QList<SearchResult> search(QString searchText);
+  QList<Backend::SearchResult> search(QString searchText);
 };
 
+} // namespace Poppler
+
+} // namespace Backend
+
+} // namespace QtPDF
 
 #endif // End header guard
 // vim: set sw=2 ts=2 et

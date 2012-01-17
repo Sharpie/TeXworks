@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2011  Charlie Sharpsteen, Stefan Löffler
+ * Copyright (C) 2011-2012  Charlie Sharpsteen, Stefan Löffler
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -19,6 +19,12 @@
 #include <locale.h>
 #endif // defined(HAVE_LOCALE_H)
 
+namespace QtPDF {
+
+namespace Backend {
+
+namespace MuPDF {
+
 QRectF toRectF(const fz_rect r)
 {
   return QRectF(QPointF(r.x0, r.y0), QPointF(r.x1, r.y1));
@@ -27,6 +33,39 @@ QRectF toRectF(const fz_rect r)
 QRectF toRectF(const fz_bbox r)
 {
   return QRectF(QPointF(r.x0, r.y0), QPointF(r.x1, r.y1));
+}
+
+QRectF toRectF(fz_obj * o)
+{
+  if (!fz_is_array(o) || fz_array_len(o) != 4)
+    return QRectF();
+  
+  return QRectF(QPointF(fz_to_real(fz_array_get(o, 0)), fz_to_real(fz_array_get(o, 1))), \
+                QPointF(fz_to_real(fz_array_get(o, 2)), fz_to_real(fz_array_get(o, 3))));
+}
+
+QColor toColor(fz_obj * o)
+{
+  if (!fz_is_array(o))
+    return QColor();
+
+  // No color = transparent
+  if (fz_array_len(o) == 0)
+    return QColor(0, 0, 0, 0);
+
+  // DeviceGray
+  if (fz_array_len(o) == 1)
+    return QColor::fromRgbF(fz_to_real(fz_array_get(o, 0)), fz_to_real(fz_array_get(o, 0)), fz_to_real(fz_array_get(o, 0)));
+
+  // DeviceRGB
+  if (fz_array_len(o) == 3)
+    return QColor::fromRgbF(fz_to_real(fz_array_get(o, 0)), fz_to_real(fz_array_get(o, 1)), fz_to_real(fz_array_get(o, 2)));
+
+  // DeviceCMYK
+  if (fz_array_len(o) == 4)
+    return QColor::fromCmykF(fz_to_real(fz_array_get(o, 0)), fz_to_real(fz_array_get(o, 1)), fz_to_real(fz_array_get(o, 2)), fz_to_real(fz_array_get(o, 3)));
+
+  return QColor();
 }
 
 // TODO: Find a better place to put this
@@ -233,8 +272,74 @@ PDFDestination toPDFDestination(pdf_xref * xref, fz_obj * dest)
       return "reference";
     return "(unknown)";
   }
-
 #endif
+
+
+// TODO: Find a better place to put this
+void initPDFAnnotation(Annotation::AbstractAnnotation * annot, Backend::Page * page, fz_obj * src)
+{
+  static char keyRect[] = "Rect";
+  static char keyContents[] = "Contents";
+  static char keyNM[] = "NM";
+  static char keyM[] = "M";
+  static char keyC[] = "C";
+  static char keyF[] = "F";
+
+  if (!annot)
+    return;
+
+  annot->setPage(page);
+
+  if (!fz_is_dict(src))
+    return;
+  
+  annot->setRect(toRectF(fz_dict_gets(src, keyRect)));
+  annot->setContents(QString::fromUtf8(fz_to_str_buf(fz_dict_gets(src, keyContents))));
+  annot->setName(QString::fromUtf8(fz_to_str_buf(fz_dict_gets(src, keyNM))));
+  annot->setLastModified(fromPDFDate(QString::fromUtf8(fz_to_str_buf(fz_dict_gets(src, keyM)))));
+  annot->setColor(toColor(fz_dict_gets(src, keyC)));
+  annot->flags() = QFlags<Annotation::AbstractAnnotation::AnnotationFlags>(fz_to_int(fz_dict_gets(src, keyF)));
+}
+
+Annotation::Popup * toPDFPopupAnnotation(Annotation::Markup * parent, fz_obj * src)
+{
+  static char keyOpen[] = "Open";
+
+  if (!fz_is_dict(src))
+    return NULL;
+
+  Annotation::Popup * retVal = new Annotation::Popup();
+
+  initPDFAnnotation(retVal, parent->page(), src);
+  retVal->setParent(parent);
+  retVal->setOpen(fz_to_bool(fz_dict_gets(src, keyOpen)));
+  return retVal;
+}
+
+void initPDFMarkupAnnotation(Annotation::Markup * annot, Page * page, fz_obj * src)
+{
+  static char keyT[] = "T";
+  static char keyRC[] = "RC";
+  static char keyCreationDate[] = "CreationDate";
+  static char keySubj[] = "Subj";
+  static char keyPopup[] = "Popup";
+
+  if (!annot)
+    return;
+
+  initPDFAnnotation(annot, page, src);
+
+  if (!fz_is_dict(src))
+    return;
+
+  annot->setTitle(QString::fromUtf8(fz_to_str_buf(fz_dict_gets(src, keyT))));
+  annot->setRichContents(QString::fromUtf8(fz_to_str_buf(fz_dict_gets(src, keyRC))));
+  annot->setCreationDate(fromPDFDate(QString::fromUtf8(fz_to_str_buf(fz_dict_gets(src, keyCreationDate)))));
+  annot->setSubject(QString::fromUtf8(fz_to_str_buf(fz_dict_gets(src, keySubj))));
+
+  annot->setPopup(toPDFPopupAnnotation(annot, fz_dict_gets(src, keyPopup)));
+}
+
 
 // Modeled after the idea behind QMutexLocker, i.e., the class sets LC_NUMERIC
 // to "C" in the contructor and resets the original setting in the destructor
@@ -257,16 +362,16 @@ public:
 
 // Document Class
 // ==============
-MuPDFDocument::MuPDFDocument(QString fileName):
+Document::Document(QString fileName):
   Super(fileName),
-  _glyph_cache(fz_new_glyph_cache()),
-  _mupdf_data(NULL)
+  _mupdf_data(NULL),
+  _glyph_cache(fz_new_glyph_cache())
 {
   _fileName = fileName;
   reload();
 }
 
-MuPDFDocument::~MuPDFDocument()
+Document::~Document()
 {
   if( _mupdf_data ){
     pdf_free_xref(_mupdf_data);
@@ -276,7 +381,7 @@ MuPDFDocument::~MuPDFDocument()
   fz_free_glyph_cache(_glyph_cache);
 }
 
-void MuPDFDocument::reload()
+void Document::reload()
 {
   MuPDFLocaleResetter lr;
 
@@ -364,21 +469,21 @@ void MuPDFDocument::reload()
   loadMetaData();
 }
 
-QSharedPointer<Page> MuPDFDocument::page(int at)
+QSharedPointer<Backend::Page> Document::page(int at)
 {
   if (at < 0 || at >= _numPages)
-    return QSharedPointer<Page>();
+    return QSharedPointer<Backend::Page>();
 
   if( _pages.isEmpty() )
     _pages.resize(_numPages);
 
   if( _pages[at].isNull() )
-    _pages[at] = QSharedPointer<Page>(new MuPDFPage(this, at));
+    _pages[at] = QSharedPointer<Backend::Page>(new Page(this, at));
 
-  return QSharedPointer<Page>(_pages[at]);
+  return QSharedPointer<Backend::Page>(_pages[at]);
 }
 
-void MuPDFDocument::loadMetaData()
+void Document::loadMetaData()
 {
   MuPDFLocaleResetter lr;
 
@@ -442,7 +547,7 @@ void MuPDFDocument::loadMetaData()
   // the data in the `Info` dictionary
 }
 
-PDFDestination MuPDFDocument::resolveDestination(const PDFDestination & namedDestination) const
+PDFDestination Document::resolveDestination(const PDFDestination & namedDestination) const
 {
   MuPDFLocaleResetter lr;
 
@@ -463,7 +568,7 @@ PDFDestination MuPDFDocument::resolveDestination(const PDFDestination & namedDes
   return toPDFDestination(_mupdf_data, dest);
 }
 
-QList<PDFFontInfo> MuPDFDocument::fonts() const
+QList<PDFFontInfo> Document::fonts() const
 {
   MuPDFLocaleResetter lr;
 
@@ -498,7 +603,7 @@ QList<PDFFontInfo> MuPDFDocument::fonts() const
         if (QString::fromAscii(fz_to_name(fz_dict_gets(_mupdf_data->table[i].obj, typeKey))) != QString::fromUtf8("Font"))
           continue;
 
-        QString subtype = fz_to_name(fz_dict_gets(_mupdf_data->table[i].obj, subtypeKey));
+        QString subtype = QString::fromUtf8(fz_to_name(fz_dict_gets(_mupdf_data->table[i].obj, subtypeKey)));
 
         // Type0 fonts have no info we need right now---all relevant data is in
         // its descendant, which again is a dict of type /Font
@@ -528,7 +633,7 @@ QList<PDFFontInfo> MuPDFDocument::fonts() const
             else {
               fz_obj * ff = fz_dict_gets(desc, fontfile3Key);
               if (fz_is_dict(ff)) {
-                QString ffSubtype = fz_to_name(fz_dict_gets(ff, subtypeKey));
+                QString ffSubtype = QString::fromUtf8(fz_to_name(fz_dict_gets(ff, subtypeKey)));
                 if (ffSubtype == QString::fromUtf8("Type1C"))
                   fi.setFontProgramType(PDFFontInfo::ProgramType_Type1CFF);
                 else if (ffSubtype == QString::fromUtf8("CIDFontType0C"))
@@ -606,7 +711,7 @@ QList<PDFFontInfo> MuPDFDocument::fonts() const
   return retVal;
 }
 
-void MuPDFDocument::recursiveConvertToC(QList<PDFToCItem> & items, pdf_outline * node) const
+void Document::recursiveConvertToC(QList<PDFToCItem> & items, pdf_outline * node) const
 {
   while (node && node->title) {
     // TODO: It seems that this works, at least for pdfs produced with pdflatex
@@ -629,7 +734,7 @@ void MuPDFDocument::recursiveConvertToC(QList<PDFToCItem> & items, pdf_outline *
   }
 }
 
-PDFToC MuPDFDocument::toc() const
+PDFToC Document::toc() const
 {
   MuPDFLocaleResetter lr;
 
@@ -646,7 +751,7 @@ PDFToC MuPDFDocument::toc() const
   return retVal;
 }
 
-bool MuPDFDocument::unlock(const QString password)
+bool Document::unlock(const QString password)
 {
   if (!_mupdf_data)
     return false;
@@ -668,8 +773,9 @@ bool MuPDFDocument::unlock(const QString password)
 
 // Page Class
 // ==========
-MuPDFPage::MuPDFPage(MuPDFDocument *parent, int at):
+Page::Page(Document *parent, int at):
   Super(parent, at),
+  _annotationsLoaded(false),
   _linksLoaded(false)
 {
   MuPDFLocaleResetter lr;
@@ -693,16 +799,16 @@ MuPDFPage::MuPDFPage(MuPDFDocument *parent, int at):
   pdf_free_page(page_data);
 }
 
-MuPDFPage::~MuPDFPage()
+Page::~Page()
 {
   if( _mupdf_page )
     fz_free_display_list(_mupdf_page);
   _mupdf_page = NULL;
 }
 
-QSizeF MuPDFPage::pageSizeF() const { return _size; }
+QSizeF Page::pageSizeF() const { return _size; }
 
-QImage MuPDFPage::renderToImage(double xres, double yres, QRect render_box, bool cache)
+QImage Page::renderToImage(double xres, double yres, QRect render_box, bool cache)
 {
   // Set up the transformation matrix for the page. Really, we just start with
   // an identity matrix and scale it using the xres, yres inputs.
@@ -711,8 +817,9 @@ QImage MuPDFPage::renderToImage(double xres, double yres, QRect render_box, bool
   render_trans = fz_concat(render_trans, fz_scale(xres/72.0, -yres/72.0));
   render_trans = fz_concat(render_trans, fz_rotate(_rotate));
 
-
+#ifdef DEBUG
   qDebug() << "Page bbox is: (" << _bbox.x0 << "," << _bbox.y0 << "|" << _bbox.x1 << "," << _bbox.y1 << ")";
+#endif
 
   fz_bbox render_bbox;
   if ( not render_box.isNull() ) {
@@ -724,13 +831,15 @@ QImage MuPDFPage::renderToImage(double xres, double yres, QRect render_box, bool
     render_bbox = fz_round_rect(fz_transform_rect(render_trans, _bbox));
   }
 
+#ifdef DEBUG
   qDebug() << "Render bbox is: (" << render_bbox.x0 << "," << render_bbox.y0 << "|" << render_bbox.x1 << "," << render_bbox.y1 << ")";
+#endif
 
   // NOTE: Using fz_device_bgr or fz_device_rbg may depend on platform endianness.
   fz_pixmap *mu_image = fz_new_pixmap_with_rect(fz_device_bgr, render_bbox);
   // Flush to white.
   fz_clear_pixmap_with_color(mu_image, 255);
-  fz_device *renderer = fz_new_draw_device(static_cast<MuPDFDocument *>(_parent)->_glyph_cache, mu_image);
+  fz_device *renderer = fz_new_draw_device(static_cast<Document *>(_parent)->_glyph_cache, mu_image);
 
   // Actually render the page.
   fz_execute_display_list(_mupdf_page, renderer, render_trans, render_bbox);
@@ -755,7 +864,7 @@ QImage MuPDFPage::renderToImage(double xres, double yres, QRect render_box, bool
   return renderedPage;
 }
 
-QList< QSharedPointer<PDFLinkAnnotation> > MuPDFPage::loadLinks()
+QList< QSharedPointer<Annotation::Link> > Page::loadLinks()
 {
   MuPDFLocaleResetter lr;
 
@@ -763,7 +872,7 @@ QList< QSharedPointer<PDFLinkAnnotation> > MuPDFPage::loadLinks()
     return _links;
 
   Q_ASSERT(_parent != NULL);
-  pdf_xref * xref = static_cast<MuPDFDocument*>(_parent)->_mupdf_data;
+  pdf_xref * xref = static_cast<Document*>(_parent)->_mupdf_data;
   Q_ASSERT(xref != NULL);
 
   _linksLoaded = true;
@@ -776,7 +885,7 @@ QList< QSharedPointer<PDFLinkAnnotation> > MuPDFPage::loadLinks()
   pdf_link * mupdfLink = page->links;
 
   while (mupdfLink) {
-    QSharedPointer<PDFLinkAnnotation> link(new PDFLinkAnnotation);
+    QSharedPointer<Annotation::Link> link(new Annotation::Link);
     link->setRect(toRectF(mupdfLink->rect));
     link->setPage(this);
     // FIXME: Initialize all other properties of PDFLinkAnnotation, such as
@@ -818,14 +927,84 @@ QList< QSharedPointer<PDFLinkAnnotation> > MuPDFPage::loadLinks()
   return _links;
 }
 
-QList<SearchResult> MuPDFPage::search(QString searchText)
+QList< QSharedPointer<Annotation::AbstractAnnotation> > Page::loadAnnotations()
+{
+  MuPDFLocaleResetter lr;
+  static char keyType[] = "Type";
+  static char keySubtype[] = "Subtype";
+
+  if (_annotationsLoaded)
+    return _annotations;
+
+  Q_ASSERT(_parent != NULL);
+  pdf_xref * xref = static_cast<Document*>(_parent)->_mupdf_data;
+  Q_ASSERT(xref != NULL);
+
+  _annotationsLoaded = true;
+  pdf_page * page;
+  if (pdf_load_page(&page, xref, _n) != fz_okay)
+    return _annotations;
+
+  if (!page)
+    return _annotations;
+  pdf_annot * mupdfAnnot = page->annots;
+  
+  while (mupdfAnnot) {
+    if (!fz_is_dict(mupdfAnnot->obj) || QString::fromAscii(fz_to_name(fz_dict_gets(mupdfAnnot->obj, keyType))) != QString::fromAscii("Annot")) {
+      mupdfAnnot = mupdfAnnot->next;
+      continue;
+    }
+
+    QString subtype = QString::fromAscii(fz_to_name(fz_dict_gets(mupdfAnnot->obj, keySubtype)));
+    if (subtype == QString::fromAscii("Text")) {
+      Annotation::Text * annot = new Annotation::Text();
+      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
+    }
+    else if (subtype == QString::fromAscii("FreeText")) {
+      Annotation::FreeText * annot = new Annotation::FreeText();
+      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
+    }
+    else if (subtype == QString::fromAscii("Caret")) {
+      Annotation::Caret * annot = new Annotation::Caret();
+      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
+    }
+    else if (subtype == QString::fromAscii("Highlight")) {
+      Annotation::Highlight * annot = new Annotation::Highlight();
+      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
+    }
+    else if (subtype == QString::fromAscii("Underline")) {
+      Annotation::Underline * annot = new Annotation::Underline();
+      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
+    }
+    else if (subtype == QString::fromAscii("Squiggly")) {
+      Annotation::Squiggly * annot = new Annotation::Squiggly();
+      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
+    }
+    else if (subtype == QString::fromAscii("StrikeOut")) {
+      Annotation::StrikeOut * annot = new Annotation::StrikeOut();
+      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
+    }
+    // TODO: Other annotation types (do we need Link annotations here?)
+    mupdfAnnot = mupdfAnnot->next;
+  }
+  return _annotations;
+}
+
+QList<SearchResult> Page::search(QString searchText)
 {
   // FIXME: Currently unimplemented and always returns an empty list.
   QList<SearchResult> results;
   fz_text_span * page_text, * span;
   fz_device * dev;
   QString text;
-  int i, j, k, spanStart;
+  int i, j, spanStart;
 
   // Use MuPDF transformations to get the text box coordinates right already
   // during fz_execute_display_list().
@@ -850,7 +1029,7 @@ QList<SearchResult> MuPDFPage::search(QString searchText)
     for (i = 0; i < span->len; ++i)
       text.append(span->text[i].c);
     if (span->eol)
-      text.append('\n');
+      text.append(QChar::fromAscii('\n'));
   }
 
   // Perform the actual search and extract box information
@@ -892,6 +1071,11 @@ QList<SearchResult> MuPDFPage::search(QString searchText)
   return results;
 }
 
+} // namespace MuPDF
+
+} // namespace Backend
+
+} // namespace QtPDF
 
 // vim: set sw=2 ts=2 et
 
