@@ -32,9 +32,9 @@ IF ( NOT DEFINED BUILD_SHARED_LIBS )
   SET(BUILD_SHARED_LIBS ON)
 ENDIF ()
 
-# ...with poppler...
-IF ( NOT DEFINED WITH_POPPLER )
-  SET(WITH_POPPLER ON)
+# ...with poppler-qt4...
+IF ( NOT DEFINED WITH_POPPLERQT4 )
+  SET(WITH_POPPLERQT4 ON)
 ENDIF ()
 
 # ...but without MuPDF
@@ -42,7 +42,7 @@ IF ( NOT DEFINED WITH_MUPDF )
   SET(WITH_MUPDF OFF)
 ENDIF ()
 
-OPTION(WITH_POPPLER "Build Poppler backend" ${WITH_POPPLER})
+OPTION(WITH_POPPLER "Build Poppler Qt4 backend" ${WITH_POPPLERQT4})
 # MuPDF backend is a bit immature, so we don't bother with it by default right
 # now.
 OPTION(WITH_MUPDF "Build MuPDF backend" ${WITH_MUPDF})
@@ -93,7 +93,7 @@ SET(QTPDF_LIBS
 
 # Backend Components
 # ------------------
-IF( WITH_POPPLER )
+IF( WITH_POPPLERQT4 )
 
   FIND_PACKAGE(Poppler REQUIRED)
   LIST(APPEND QTPDF_INCLUDE_DIRS ${POPPLER_QT4_INCLUDE_DIR})
@@ -178,6 +178,7 @@ ENDIF()
 # -------
 SET(QTPDF_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFDocumentView.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFDocumentWidget.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFDocumentTools.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFBackend.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFTransitions.cpp
@@ -187,6 +188,7 @@ SET(QTPDF_SRCS
 
 SET(QTPDF_MOC_HDRS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFDocumentView.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFDocumentWidget.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFDocumentTools.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFBackend.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/PDFTransitions.h
@@ -196,10 +198,10 @@ SET(QTPDF_MOC_HDRS
 
 SET(QTPDF_FLAGS "")
 
-IF( WITH_POPPLER )
-  LIST(APPEND QTPDF_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/PopplerBackend.cpp)
-  LIST(APPEND QTPDF_MOC_HDRS ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/PopplerBackend.h)
-  SET(QTPDF_FLAGS "${QTPDF_FLAGS} -DUSE_POPPLER")
+IF( WITH_POPPLERQT4 )
+  LIST(APPEND QTPDF_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/PopplerQt4Backend.cpp)
+  LIST(APPEND QTPDF_MOC_HDRS ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/PopplerQt4Backend.h)
+  SET(QTPDF_FLAGS "${QTPDF_FLAGS} -DUSE_POPPLERQT4")
 ENDIF()
 
 IF( WITH_MUPDF )
@@ -255,13 +257,25 @@ SET(PDFVIEWER_RCS
   ${CMAKE_CURRENT_SOURCE_DIR}/icons.qrc
 )
 
+
+SET(QTPDFTEST_SRCS
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit-tests/TestQtPDF.cpp
+)
+
+SET(QTPDFTEST_MOC_HDRS
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit-tests/TestQtPDF.h
+)
+
+
 QT4_ADD_RESOURCES(PDFVIEWER_RESOURCES ${PDFVIEWER_RCS})
 QT4_WRAP_CPP(PDFVIEWER_MOC ${PDFVIEWER_MOC_HDRS})
 
+QT4_WRAP_CPP(QTPDFTEST_MOC ${QTPDFTEST_MOC_HDRS})
 
-IF( WITH_POPPLER )
 
-  ADD_EXECUTABLE(poppler_viewer
+IF( WITH_POPPLERQT4 )
+
+  ADD_EXECUTABLE(poppler-qt4_viewer
     ${PDFVIEWER_SRCS}
     ${PDFVIEWER_MOC} ${PDFVIEWER_RESOURCES}
   )
@@ -270,11 +284,24 @@ IF( WITH_POPPLER )
   # Setting properties on a target sets those properties on all source files
   # that are built to create that target. Other targets can re-use the sources
   # and build with different flags. Pretty handy.
-  SET_TARGET_PROPERTIES(poppler_viewer PROPERTIES
-    COMPILE_FLAGS -DUSE_POPPLER
+  SET_TARGET_PROPERTIES(poppler-qt4_viewer PROPERTIES
+    COMPILE_FLAGS -DUSE_POPPLERQT4
   )
 
-  TARGET_LINK_LIBRARIES(poppler_viewer qtpdf)
+  TARGET_LINK_LIBRARIES(poppler-qt4_viewer qtpdf)
+
+
+  IF( ${CMAKE_BUILD_TYPE} STREQUAL "Debug" )
+    ADD_EXECUTABLE(poppler-qt4_test
+      ${QTPDFTEST_SRCS}
+      ${QTPDFTEST_MOC}
+    )
+    SET_TARGET_PROPERTIES(poppler-qt4_test PROPERTIES
+      COMPILE_FLAGS -DUSE_POPPLERQT4
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/unit-tests
+    )
+    TARGET_LINK_LIBRARIES(poppler-qt4_test qtpdf QtTest)
+  ENDIF()
 
 ENDIF()
 
@@ -290,6 +317,18 @@ IF( WITH_MUPDF )
   )
 
   TARGET_LINK_LIBRARIES(mupdf_viewer qtpdf)
+
+  IF( ${CMAKE_BUILD_TYPE} STREQUAL "Debug" )
+    ADD_EXECUTABLE(mupdf_test
+      ${QTPDFTEST_SRCS}
+      ${QTPDFTEST_MOC}
+    )
+    SET_TARGET_PROPERTIES(mupdf_test PROPERTIES
+      COMPILE_FLAGS -DUSE_MUPDF
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/unit-tests
+    )
+    TARGET_LINK_LIBRARIES(mupdf_test qtpdf QtTest)
+  ENDIF()
 
 ENDIF()
 
@@ -333,7 +372,7 @@ CONFIG_INFO("Version" ${PROJECT_VERSION})
 CONFIG_INFO("Compiler optimization" ${CMAKE_BUILD_TYPE})
 message("")
 
-CONFIG_YESNO("Poppler backend" WITH_POPPLER)
+CONFIG_YESNO("Poppler-Qt4 backend" WITH_POPPLERQT4)
 CONFIG_YESNO("MuPDF backend" WITH_MUPDF)
 CONFIG_YESNO("Shared library" BUILD_SHARED_LIBS)
 

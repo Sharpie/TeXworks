@@ -66,13 +66,13 @@ TODO
  - context menu
  - Highlighting! (to show syncing destination, search results, etc.)
  - Port scripting-related functions from Tw (if any)
- - Add a PDFDocumentWidget, derived from PDFDocumentView, which encapsulates the
-   scene and provides, e.g., a load() function for ease of use (similar to what
-   Qt does, see QTreeView vs. QTreeWidget)
- - Possibility to reload current file (e.g., if it changed on disk); note that
+ - ~~Possibility to reload current file (e.g., if it changed on disk); note that
    this requires some reconsideration of memory management, as Page object
    could change, which would have to be propagated upwards to every object
-   holding a pointer to them (e.g., PDFPageGraphicsItem)
+   holding a pointer to them (e.g., PDFPageGraphicsItem)~~ __DONE__
+ - ~~Add a PDFDocumentWidget, derived from PDFDocumentView, which encapsulates the
+   scene and provides, e.g., a load() function for ease of use (similar to what
+   Qt does, see QTreeView vs. QTreeWidget)~~ __DONE__
  - ~~Make program translatable; this probably entails creating a (dummy) Qt .pro
    file so we can use the normal Qt linguist approach~~ __DONE__
  - ~~Properly namespace the code~~ __DONE__
@@ -119,6 +119,8 @@ TODO
  - ~~Don't show mouse cursor while using the magnifier~~ __DONE__
 
 ### Wishlist
+ - Add automated (unit) tests (presumably using the QtTest framework as that
+   directly supports generating and monitoring Qt events) __STARTED__
  - Speed up magnifier; in Tw, it seems much more responsive. This might be due
    to using centerOn in PDFDocumentMagnifierView::setPosition but needs closer
    investigation
@@ -140,7 +142,7 @@ TODO
    - full screen
    - ~~transition support?~~ __DONE__
  - save page as image (subject to permissions)
- - ~~selecting (and copying) text (subject to permissions)~~ __DONE
+ - ~~selecting (and copying) text (subject to permissions)~~ __DONE__
  - selecting (and copying/saving) images (subject to permissions)
  - ~~Provide a grayscale mode~~ __DONE__
  - ~~Implement text search for PDF files.~~ __DONE__

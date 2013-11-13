@@ -21,13 +21,14 @@
 #ifndef PopplerBackend_H
 #define PopplerBackend_H
 
+#include "PDFBackend.h"
 #include <poppler/qt4/poppler-qt4.h>
 
 namespace QtPDF {
 
 namespace Backend {
 
-namespace Poppler {
+namespace PopplerQt4 {
 
 class Document;
 class Page;
@@ -44,21 +45,27 @@ class Document: public Backend::Document
 protected:
   // Poppler is not threadsafe, so some operations need to be serialized with a
   // mutex.
-  QMutex *_doc_lock;
+  QMutex * _poppler_docLock;
   QList<PDFFontInfo> _fonts;
   bool _fontsLoaded;
+
+  // The following two methods are not thread-safe because they don't acquire a
+  // read lock. This is to enable methods that have a write lock to use them.
+  bool _isValid() const { return (_poppler_doc != NULL); }
+  bool _isLocked() const { return (_poppler_doc ? _poppler_doc->isLocked() : false); }
 
 public:
   Document(QString fileName);
   ~Document();
 
-  bool isValid() const { return (_poppler_doc != NULL); }
-  bool isLocked() const { return (_poppler_doc ? _poppler_doc->isLocked() : false); }
+  bool isValid() const { QReadLocker docLocker(_docLock.data()); return _isValid(); }
+  bool isLocked() const { QReadLocker docLocker(_docLock.data()); return _isLocked(); }
 
+  void reload();
   bool unlock(const QString password);
 
-  QSharedPointer<Backend::Page> page(int at);
-  QSharedPointer<Backend::Page> page(int at) const;
+  QWeakPointer<Backend::Page> page(int at);
+  QWeakPointer<Backend::Page> page(int at) const;
   PDFDestination resolveDestination(const PDFDestination & namedDestination) const;
 
   PDFToC toc() const;
@@ -71,6 +78,8 @@ private:
 
 class Page: public Backend::Page
 {
+  friend class Document;
+
   typedef Backend::Page Super;
   QSharedPointer< ::Poppler::Page > _poppler_page;
   QList< QSharedPointer<Annotation::AbstractAnnotation> > _annotations;
@@ -79,9 +88,11 @@ class Page: public Backend::Page
   bool _linksLoaded;
 
   void loadTransitionData();
-  
+
+protected:
+  Page(Document *parent, int at, QSharedPointer<QReadWriteLock> docLock);
+
 public:
-  Page(Document *parent, int at);
   ~Page();
 
   QSizeF pageSizeF() const;
@@ -92,16 +103,31 @@ public:
   QList< QSharedPointer<Annotation::AbstractAnnotation> > loadAnnotations();
   QList< Backend::Page::Box > boxes();
   QString selectedText(const QList<QPolygonF> & selection);
-  
+
   QList<Backend::SearchResult> search(QString searchText);
 };
 
-} // namespace Poppler
+} // namespace PopplerQt4
 
 } // namespace Backend
+
+class PopplerQt4Backend : public BackendInterface
+{
+  Q_OBJECT
+  Q_INTERFACES(QtPDF::BackendInterface)
+public:
+  PopplerQt4Backend() { }
+  virtual ~PopplerQt4Backend() { }
+
+  virtual QSharedPointer<Backend::Document> newDocument(const QString & fileName) {
+    return QSharedPointer<Backend::Document>(new Backend::PopplerQt4::Document(fileName));
+  }
+
+  virtual QString name() const { return QString::fromAscii("poppler-qt4"); }
+  virtual bool canHandleFile(const QString & fileName) { return QFileInfo(fileName).suffix() == QString::fromAscii("pdf"); }
+};
 
 } // namespace QtPDF
 
 #endif // End header guard
 // vim: set sw=2 ts=2 et
-

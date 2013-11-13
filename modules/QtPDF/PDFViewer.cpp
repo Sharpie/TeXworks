@@ -3,27 +3,20 @@
 PDFViewer::PDFViewer(const QString pdf_doc, QWidget *parent, Qt::WindowFlags flags) :
   QMainWindow(parent, flags)
 {
+  QtPDF::PDFDocumentWidget *docWidget = new QtPDF::PDFDocumentWidget(this);
+  connect(this, SIGNAL(switchInterfaceLocale(QLocale)), docWidget, SLOT(switchInterfaceLocale(QLocale)));
+
 #ifdef USE_MUPDF
-  QtPDF::Backend::Document *a_pdf_doc = new QtPDF::Backend::MuPDF::Document(pdf_doc);
-#elif USE_POPPLER
-  QtPDF::Backend::Document *a_pdf_doc = new QtPDF::Backend::Poppler::Document(pdf_doc);
+  docWidget->setDefaultBackend(QString::fromAscii("mupdf"));
+#elif USE_POPPLERQT4
+  docWidget->setDefaultBackend(QString::fromAscii("poppler-qt4"));
 #else
-  #error Either the Poppler or the MuPDF backend is required
+  #error At least one backend is required
 #endif
 
-  QtPDF::PDFDocumentView *docView = new QtPDF::PDFDocumentView(this);
-  connect(this, SIGNAL(switchInterfaceLocale(QLocale)), docView, SLOT(switchInterfaceLocale(QLocale)));
-
-  if (a_pdf_doc) {
-    // Note: Don't pass `this` (or any other QObject*) as parent to the new
-    // PDFDocumentScene as that would cause docScene to be destroyed with its
-    // parent, thereby bypassing the QSharedPointer mechanism. docScene will be
-    // freed automagically when the last QSharedPointer pointing to it will be
-    // destroyed.
-    QSharedPointer<QtPDF::PDFDocumentScene> docScene(new QtPDF::PDFDocumentScene(a_pdf_doc));
-    docView->setScene(docScene);
-  }
-  docView->goFirst();
+  if (!pdf_doc.isEmpty() && docWidget)
+    docWidget->load(pdf_doc);
+  docWidget->goFirst();
 
   _counter = new PageCounter(this->statusBar());
   _zoomWdgt = new ZoomTracker(this);
@@ -33,33 +26,33 @@ PDFViewer::PDFViewer(const QString pdf_doc, QWidget *parent, Qt::WindowFlags fla
   _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/document-open.png")), tr("Open..."), this, SLOT(open()));
   _toolBar->addSeparator();
 
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/zoomin.png")), tr("Zoom In"), docView, SLOT(zoomIn()));
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/zoomout.png")), tr("Zoom Out"), docView, SLOT(zoomOut()));
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/fitwidth.png")), tr("Fit to Width"), docView, SLOT(zoomFitWidth()));
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/fitwindow.png")), tr("Fit to Window"), docView, SLOT(zoomFitWindow()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/zoomin.png")), tr("Zoom In"), docWidget, SLOT(zoomIn()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/zoomout.png")), tr("Zoom Out"), docWidget, SLOT(zoomOut()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/fitwidth.png")), tr("Fit to Width"), docWidget, SLOT(zoomFitWidth()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/fitwindow.png")), tr("Fit to Window"), docWidget, SLOT(zoomFitWindow()));
 
   _toolBar->addSeparator();
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/pagemode-single.png")), tr("Single Page Mode"), docView, SLOT(setSinglePageMode()));
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/pagemode-continuous.png")), tr("One Column Continuous Page Mode"), docView, SLOT(setOneColContPageMode()));
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/pagemode-twocols.png")), tr("Two Columns Continuous Page Mode"), docView, SLOT(setTwoColContPageMode()));
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/pagemode-present.png")), tr("Presentation Mode"), docView, SLOT(setPresentationMode()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/pagemode-single.png")), tr("Single Page Mode"), docWidget, SLOT(setSinglePageMode()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/pagemode-continuous.png")), tr("One Column Continuous Page Mode"), docWidget, SLOT(setOneColContPageMode()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/pagemode-twocols.png")), tr("Two Columns Continuous Page Mode"), docWidget, SLOT(setTwoColContPageMode()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/pagemode-present.png")), tr("Presentation Mode"), docWidget, SLOT(setPresentationMode()));
   // TODO: fullscreen mode for presentations
 
   _toolBar->addSeparator();
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/zoom.png")), tr("Magnify"), docView, SLOT(setMouseModeMagnifyingGlass()));
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/hand.png")), tr("Pan"), docView, SLOT(setMouseModeMove()));
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/zoom-select.png")), tr("Marquee Zoom"), docView, SLOT(setMouseModeMarqueeZoom()));
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/measure.png")), tr("Measure"), docView, SLOT(setMouseModeMeasure()));
-  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/select-text.png")), tr("Select"), docView, SLOT(setMouseModeSelect()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/zoom.png")), tr("Magnify"), docWidget, SLOT(setMouseModeMagnifyingGlass()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/hand.png")), tr("Pan"), docWidget, SLOT(setMouseModeMove()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/zoom-select.png")), tr("Marquee Zoom"), docWidget, SLOT(setMouseModeMarqueeZoom()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/measure.png")), tr("Measure"), docWidget, SLOT(setMouseModeMeasure()));
+  _toolBar->addAction(QIcon(QString::fromUtf8(":/icons/select-text.png")), tr("Select"), docWidget, SLOT(setMouseModeSelect()));
 
-  _counter->setLastPage(docView->lastPage());
-  connect(docView, SIGNAL(changedPage(int)), _counter, SLOT(setCurrentPage(int)));
-  connect(docView, SIGNAL(changedZoom(qreal)), _zoomWdgt, SLOT(setZoom(qreal)));
-  connect(docView, SIGNAL(requestOpenUrl(const QUrl)), this, SLOT(openUrl(const QUrl)));
-  connect(docView, SIGNAL(requestOpenPdf(QString, int, bool)), this, SLOT(openPdf(QString, int, bool)));
-  connect(docView, SIGNAL(contextClick(const int, const QPointF)), this, SLOT(syncFromPdf(const int, const QPointF)));
-  connect(docView, SIGNAL(searchProgressChanged(int, int)), this, SLOT(searchProgressChanged(int, int)));
-  connect(docView, SIGNAL(changedDocument(const QSharedPointer<QtPDF::Backend::Document>)), this, SLOT(documentChanged(const QSharedPointer<QtPDF::Backend::Document>)));
+  _counter->setLastPage(docWidget->lastPage());
+  connect(docWidget, SIGNAL(changedPage(int)), _counter, SLOT(setCurrentPage(int)));
+  connect(docWidget, SIGNAL(changedZoom(qreal)), _zoomWdgt, SLOT(setZoom(qreal)));
+  connect(docWidget, SIGNAL(requestOpenUrl(const QUrl)), this, SLOT(openUrl(const QUrl)));
+  connect(docWidget, SIGNAL(requestOpenPdf(QString, int, bool)), this, SLOT(openPdf(QString, int, bool)));
+  connect(docWidget, SIGNAL(contextClick(const int, const QPointF)), this, SLOT(syncFromPdf(const int, const QPointF)));
+  connect(docWidget, SIGNAL(searchProgressChanged(int, int)), this, SLOT(searchProgressChanged(int, int)));
+  connect(docWidget, SIGNAL(changedDocument(const QWeakPointer<QtPDF::Backend::Document>)), this, SLOT(documentChanged(const QWeakPointer<QtPDF::Backend::Document>)));
 
   _toolBar->addSeparator();
 #ifdef DEBUG
@@ -69,22 +62,22 @@ PDFViewer::PDFViewer(const QString pdf_doc, QWidget *parent, Qt::WindowFlags fla
   _toolBar->addSeparator();
 #endif
   _toolBar->addWidget(_search);
-  connect(_search, SIGNAL(searchRequested(QString)), docView, SLOT(search(QString)));
-  connect(_search, SIGNAL(gotoNextResult()), docView, SLOT(nextSearchResult()));
-  connect(_search, SIGNAL(gotoPreviousResult()), docView, SLOT(previousSearchResult()));
-  connect(_search, SIGNAL(searchCleared()), docView, SLOT(clearSearchResults()));
+  connect(_search, SIGNAL(searchRequested(QString)), docWidget, SLOT(search(QString)));
+  connect(_search, SIGNAL(gotoNextResult()), docWidget, SLOT(nextSearchResult()));
+  connect(_search, SIGNAL(gotoPreviousResult()), docWidget, SLOT(previousSearchResult()));
+  connect(_search, SIGNAL(searchCleared()), docWidget, SLOT(clearSearchResults()));
 
   statusBar()->addPermanentWidget(_counter);
   statusBar()->addWidget(_zoomWdgt);
   addToolBar(_toolBar);
-  setCentralWidget(docView);
-  
-  QDockWidget * toc = docView->dockWidget(QtPDF::PDFDocumentView::Dock_TableOfContents, this);
+  setCentralWidget(docWidget);
+
+  QDockWidget * toc = docWidget->dockWidget(QtPDF::PDFDocumentView::Dock_TableOfContents, this);
   addDockWidget(Qt::LeftDockWidgetArea, toc);
-  tabifyDockWidget(toc, docView->dockWidget(QtPDF::PDFDocumentView::Dock_MetaData, this));
-  tabifyDockWidget(toc, docView->dockWidget(QtPDF::PDFDocumentView::Dock_Fonts, this));
-  tabifyDockWidget(toc, docView->dockWidget(QtPDF::PDFDocumentView::Dock_Permissions, this));
-  tabifyDockWidget(toc, docView->dockWidget(QtPDF::PDFDocumentView::Dock_Annotations, this));
+  tabifyDockWidget(toc, docWidget->dockWidget(QtPDF::PDFDocumentView::Dock_MetaData, this));
+  tabifyDockWidget(toc, docWidget->dockWidget(QtPDF::PDFDocumentView::Dock_Fonts, this));
+  tabifyDockWidget(toc, docWidget->dockWidget(QtPDF::PDFDocumentView::Dock_Permissions, this));
+  tabifyDockWidget(toc, docWidget->dockWidget(QtPDF::PDFDocumentView::Dock_Annotations, this));
   toc->raise();
 }
 
@@ -94,34 +87,17 @@ void PDFViewer::open()
   if (pdf_doc.isEmpty())
     return;
 
-  QtPDF::PDFDocumentView * docView = qobject_cast<QtPDF::PDFDocumentView*>(centralWidget());
-  Q_ASSERT(docView != NULL);
-
-#ifdef USE_MUPDF
-  QtPDF::Backend::Document *a_pdf_doc = new QtPDF::Backend::MuPDF::Document(pdf_doc);
-#elif USE_POPPLER
-  QtPDF::Backend::Document *a_pdf_doc = new QtPDF::Backend::Poppler::Document(pdf_doc);
-#else
-  #error Either the Poppler or the MuPDF backend is required
-#endif
-
-  if (a_pdf_doc && a_pdf_doc->isValid()) {
-    // Note: Don't pass `this` (or any other QObject*) as parent to the new
-    // PDFDocumentScene as that would cause docScene to be destroyed with its
-    // parent, thereby bypassing the QSharedPointer mechanism. docScene will be
-    // freed automagically when the last QSharedPointer pointing to it will be
-    // destroyed.
-    QSharedPointer<QtPDF::PDFDocumentScene> docScene(new QtPDF::PDFDocumentScene(a_pdf_doc));
-    docView->setScene(docScene);
-  }
-  else
-    docView->setScene(QSharedPointer<QtPDF::PDFDocumentScene>());
+  QtPDF::PDFDocumentWidget * docWidget = qobject_cast<QtPDF::PDFDocumentWidget*>(centralWidget());
+  Q_ASSERT(docWidget != NULL);
+  docWidget->load(pdf_doc);
 }
 
-void PDFViewer::documentChanged(const QSharedPointer<QtPDF::Backend::Document> newDoc)
+void PDFViewer::documentChanged(const QWeakPointer<QtPDF::Backend::Document> newDoc)
 {
-  if (_counter)
-    _counter->setLastPage(newDoc->numPages());
+  if (_counter) {
+    QSharedPointer<QtPDF::Backend::Document> doc(newDoc.toStrongRef());
+    _counter->setLastPage(doc->numPages());
+  }
 }
 
 void PDFViewer::searchProgressChanged(int percent, int occurrences)

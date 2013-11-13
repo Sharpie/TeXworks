@@ -12,14 +12,14 @@
  * more details.
  */
 
-// NOTE: `PopplerBackend.h` is included via `PDFBackend.h`
+// NOTE: `PopplerQt4Backend.h` is included via `PDFBackend.h`
 #include <PDFBackend.h>
 
 namespace QtPDF {
 
 namespace Backend {
 
-namespace Poppler {
+namespace PopplerQt4 {
 
 // TODO: Find a better place to put this
 PDFDestination toPDFDestination(const ::Poppler::Document * doc, const ::Poppler::LinkDestination & dest)
@@ -79,8 +79,9 @@ PDFDestination toPDFDestination(const ::Poppler::Document * doc, const ::Poppler
   return retVal;
 }
 
-void convertAnnotation(Annotation::AbstractAnnotation * dest, const ::Poppler::Annotation * src, Page * page)
+void convertAnnotation(Annotation::AbstractAnnotation * dest, const ::Poppler::Annotation * src, QWeakPointer<Backend::Page> thePage)
 {
+  QSharedPointer<Backend::Page> page(thePage.toStrongRef());
   if (!dest || !src || !page)
     return;
 
@@ -90,7 +91,7 @@ void convertAnnotation(Annotation::AbstractAnnotation * dest, const ::Poppler::A
   dest->setContents(src->contents());
   dest->setName(src->uniqueName());
   dest->setLastModified(src->modificationDate());
-  dest->setPage(page);
+  dest->setPage(thePage);
 
   // TODO: Does poppler provide the color anywhere?
   // dest->setColor();
@@ -111,7 +112,7 @@ void convertAnnotation(Annotation::AbstractAnnotation * dest, const ::Poppler::A
     flags |= Annotation::AbstractAnnotation::Annotation_Locked;
   if (src->flags() & ::Poppler::Annotation::ToggleHidingOnMouse)
     flags |= Annotation::AbstractAnnotation::Annotation_ToggleNoView;
-  
+
   if (dest->isMarkup()) {
     Annotation::Markup * annot = static_cast<Annotation::Markup*>(dest);
     annot->setAuthor(src->author());
@@ -125,19 +126,47 @@ void convertAnnotation(Annotation::AbstractAnnotation * dest, const ::Poppler::A
 Document::Document(QString fileName):
   Super(fileName),
   _poppler_doc(::Poppler::Document::load(fileName)),
-  _doc_lock(new QMutex()),
+  _poppler_docLock(new QMutex()),
   _fontsLoaded(false)
 {
+#ifdef DEBUG
+//  qDebug() << "PopplerQt4::Document::Document(" << fileName << ")";
+#endif
   parseDocument();
 }
 
 Document::~Document()
 {
+#ifdef DEBUG
+//  qDebug() << "PopplerQt4::Document::~Document()";
+#endif
+  clearPages();
+}
+
+void Document::reload()
+{
+  QWriteLocker docLocker(_docLock.data());
+
+  clearPages();
+  _processingThread.clearWorkStack();
+  _pageCache.clear();
+
+  {
+    QMutexLocker l(_poppler_docLock);
+    _poppler_doc = QSharedPointer< ::Poppler::Document >(::Poppler::Document::load(_fileName));
+  }
+
+  // TODO: possibly unlock the new document again if it was previously unlocked
+  // and the password is still the same
+
+  parseDocument();
 }
 
 void Document::parseDocument()
 {
-  if (!_poppler_doc || isLocked())
+  QWriteLocker docLocker(_docLock.data());
+
+  if (!_poppler_doc || _isLocked())
     return;
 
   _numPages = _poppler_doc->numPages();
@@ -172,6 +201,7 @@ void Document::parseDocument()
   _poppler_doc->setRenderHint(::Poppler::Document::TextAntialiasing);
 
   // Load meta data
+  clearMetaData();
   QStringList metaKeys = _poppler_doc->infoKeys();
   if (metaKeys.contains(QString::fromUtf8("Title"))) {
     _meta_title = _poppler_doc->info(QString::fromUtf8("Title"));
@@ -211,35 +241,52 @@ void Document::parseDocument()
   // converted to a string representation properly.
   _meta_trapped = Trapped_Unknown;
     metaKeys.removeAll(QString::fromUtf8("Trapped"));
-  
+
   foreach (QString key, metaKeys)
     _meta_other[key] = _poppler_doc->info(key);
 }
 
-QSharedPointer<Backend::Page> Document::page(int at)
+QWeakPointer<Backend::Page> Document::page(int at)
 {
-  if (at < 0 || at >= _numPages)
-    return QSharedPointer<Backend::Page>();
+  {
+    QReadLocker docLocker(_docLock.data());
+
+    if (at < 0 || at >= _numPages)
+      return QWeakPointer<Backend::Page>();
+
+    if (at < _pages.size() && !_pages[at].isNull())
+      return _pages[at];
+  }
+
+  // if we get here, the page is not in the array
+  QWriteLocker docLocker(_docLock.data());
+
+  // recheck everything that could have changed before we got the write lock
+  if (at >= _numPages)
+    return QWeakPointer<Backend::Page>();
+  if (at < _pages.size() && !_pages[at].isNull())
+    return _pages[at].toWeakRef();
 
   if( _pages.isEmpty() )
     _pages.resize(_numPages);
 
-  if( _pages[at].isNull() )
-    _pages[at] = QSharedPointer<Backend::Page>(new Page(this, at));
-
-  return QSharedPointer<Backend::Page>(_pages[at]);
+  _pages[at] = QSharedPointer<Backend::Page>(new Page(this, at, _docLock));
+  return _pages[at].toWeakRef();
 }
 
-QSharedPointer<Backend::Page> Document::page(int at) const
+QWeakPointer<Backend::Page> Document::page(int at) const
 {
-  if (at < 0 || at >= _numPages || at >= _pages.size())
-    return QSharedPointer<Backend::Page>();
+  QReadLocker docLocker(_docLock.data());
 
-  return QSharedPointer<Backend::Page>(_pages[at]);
+  if (at < 0 || at >= _numPages || at >= _pages.size())
+    return QWeakPointer<Backend::Page>();
+
+  return QWeakPointer<Backend::Page>(_pages[at]);
 }
 
 PDFDestination Document::resolveDestination(const PDFDestination & namedDestination) const
 {
+  QReadLocker docLocker(_docLock.data());
   Q_ASSERT(!_poppler_doc.isNull());
 
   // If namedDestination is not a named destination at all, simply return a copy
@@ -292,8 +339,10 @@ void Document::recursiveConvertToC(QList<PDFToCItem> & items, QDomNode node) con
 
 PDFToC Document::toc() const
 {
+  QReadLocker docLocker(_docLock.data());
+
   PDFToC retVal;
-  if (!_poppler_doc || isLocked())
+  if (!_poppler_doc || _isLocked())
     return retVal;
 
   QDomDocument * toc = _poppler_doc->toc();
@@ -306,10 +355,12 @@ PDFToC Document::toc() const
 
 QList<PDFFontInfo> Document::fonts() const
 {
+  QReadLocker docLocker(_docLock.data());
+
   if (_fontsLoaded)
     return _fonts;
 
-  if (!_poppler_doc || isLocked())
+  if (!_poppler_doc || _isLocked())
     return QList<PDFFontInfo>();
 
   // Since ::Poppler::Document::fonts() is extremely slow, we need to cache the
@@ -317,7 +368,7 @@ QList<PDFFontInfo> Document::fonts() const
   QList<PDFFontInfo> & fonts = const_cast<QList<PDFFontInfo>&>(_fonts);
   bool & fontsLoaded = const_cast<bool&>(_fontsLoaded);
   fontsLoaded = true;
-  
+
   foreach(::Poppler::FontInfo popplerFontInfo, _poppler_doc->fonts()) {
     PDFFontInfo fi;
     if (popplerFontInfo.isEmbedded())
@@ -393,6 +444,8 @@ QList<PDFFontInfo> Document::fonts() const
 
 bool Document::unlock(const QString password)
 {
+  QWriteLocker docLocker(_docLock.data());
+
   if (!_poppler_doc)
     return false;
   // Note: we try unlocking regardless of what isLocked() returns as the user
@@ -412,8 +465,8 @@ bool Document::unlock(const QString password)
 
 // Page Class
 // ==========
-Page::Page(Document *parent, int at):
-  Super(parent, at),
+Page::Page(Document *parent, int at, QSharedPointer<QReadWriteLock> docLock):
+  Super(parent, at, docLock),
   _annotationsLoaded(false),
   _linksLoaded(false)
 {
@@ -423,22 +476,32 @@ Page::Page(Document *parent, int at):
 
 Page::~Page()
 {
+  QWriteLocker pageLocker(_pageLock);
 }
 
 // TODO: Does this operation require obtaining the Poppler document mutex? If
 // so, it would be better to store the value in a member variable during
 // initialization.
-QSizeF Page::pageSizeF() const {
+QSizeF Page::pageSizeF() const
+{
+  QReadLocker pageLocker(_pageLock);
+
   Q_ASSERT(_poppler_page != NULL);
   return _poppler_page->pageSizeF();
 }
 
 QImage Page::renderToImage(double xres, double yres, QRect render_box, bool cache)
 {
+  QReadLocker docLocker(_docLock.data());
+  QReadLocker pageLocker(_pageLock);
+  if (!_parent)
+    return QImage();
+
   QImage renderedPage;
 
-  // Rendering pages is not thread safe.
-  QMutexLocker docLock(static_cast<Document *>(_parent)->_doc_lock);
+  {
+    // Rendering pages is not thread safe.
+    QMutexLocker popplerDocLock(static_cast<Backend::PopplerQt4::Document *>(_parent)->_poppler_docLock);
     if( render_box.isNull() ) {
       // A null QRect has a width and height of 0 --- we will tell Poppler to render the whole
       // page.
@@ -447,7 +510,7 @@ QImage Page::renderToImage(double xres, double yres, QRect render_box, bool cach
       renderedPage = _poppler_page->renderToImage(xres, yres,
           render_box.x(), render_box.y(), render_box.width(), render_box.height());
     }
-  docLock.unlock();
+  }
 
   if( cache ) {
     PDFPageTile key(xres, yres, render_box, _n);
@@ -461,20 +524,38 @@ QImage Page::renderToImage(double xres, double yres, QRect render_box, bool cach
 
 QList< QSharedPointer<Annotation::Link> > Page::loadLinks()
 {
-  if (_linksLoaded)
+  {
+    QReadLocker pageLocker(_pageLock);
+
+    if (_linksLoaded || !_parent)
+      return _links;
+  }
+
+  QReadLocker docLocker(_docLock.data());
+  QWriteLocker pageLocker(_pageLock);
+
+  // Check if the links were loaded in another thread in the meantime
+  if (_linksLoaded || !_parent)
     return _links;
 
+
+  Q_ASSERT(_poppler_page != NULL);
   _linksLoaded = true;
-  // Loading links is not thread safe.
-  QMutexLocker docLock(static_cast<Document *>(_parent)->_doc_lock);
-  QList< ::Poppler::Link *> popplerLinks = _poppler_page->links();
-  QList< ::Poppler::Annotation *> popplerAnnots = _poppler_page->annotations();
-  docLock.unlock();
+  QList< ::Poppler::Link *> popplerLinks;
+  QList< ::Poppler::Annotation *> popplerAnnots;
+  {
+    // Loading links is not thread safe.
+    QMutexLocker popplerDocLock(static_cast<Backend::PopplerQt4::Document *>(_parent)->_poppler_docLock);
+    popplerLinks = _poppler_page->links();
+    popplerAnnots = _poppler_page->annotations();
+  }
 
   // Note: Poppler gives the linkArea in normalized coordinates, i.e., in the
   // range of 0..1, with y=0 at the top. We use pdf coordinates internally, so
   // we need to transform things accordingly.
-  QTransform denormalize = QTransform::fromScale(pageSizeF().width(), -pageSizeF().height()).translate(0,  -1);
+  // Note: Cannot use pageSizeF() here as that tries to acquire a readLock when
+  // we already hold a writeLock, which would result in deadlock
+  QTransform denormalize = QTransform::fromScale(_poppler_page->pageSizeF().width(), -_poppler_page->pageSizeF().height()).translate(0,  -1);
 
   // Convert poppler links to PDFLinkAnnotations
   foreach (::Poppler::Link * popplerLink, popplerLinks) {
@@ -495,7 +576,7 @@ QList< QSharedPointer<Annotation::Link> > Page::loadLinks()
         continue;
 
       ::Poppler::LinkAnnotation * popplerLinkAnnot = static_cast< ::Poppler::LinkAnnotation *>(popplerAnnot);
-      convertAnnotation(link.data(), popplerLinkAnnot, this);
+      convertAnnotation(link.data(), popplerLinkAnnot, _parent->page(_n));
       // TODO: Does Poppler provide an easy interface to all quadPoints?
       // Note: ::Poppler::LinkAnnotation::HighlightMode is identical to PDFLinkAnnotation::HighlightingMode
       link->setHighlightingMode((Annotation::Link::HighlightingMode)popplerLinkAnnot->linkHighlightMode());
@@ -503,7 +584,7 @@ QList< QSharedPointer<Annotation::Link> > Page::loadLinks()
     }
 
     link->setRect(denormalize.mapRect(popplerLink->linkArea()));
-    
+
     switch (popplerLink->linkType()) {
       case ::Poppler::Link::Goto:
         {
@@ -548,17 +629,30 @@ QList< QSharedPointer<Annotation::Link> > Page::loadLinks()
 
 QList< QSharedPointer<Annotation::AbstractAnnotation> > Page::loadAnnotations()
 {
-  if (_annotationsLoaded)
+  {
+    QReadLocker pageLocker(_pageLock);
+
+    if (_annotationsLoaded)
+      return _annotations;
+  }
+
+  QReadLocker docLocker(_docLock.data());
+  QWriteLocker pageLocker(_pageLock);
+  // Check if the annotations were loaded in another thread in the meantime
+  if (_annotationsLoaded || !_poppler_page || !_parent)
     return _annotations;
 
   _annotationsLoaded = true;
-  if (!_poppler_page)
-    return _annotations;
-  
-  // Loading annotations is not thread safe.
-  QMutexLocker docLock(static_cast<Document *>(_parent)->_doc_lock);
-  QList< ::Poppler::Annotation *> popplerAnnots = _poppler_page->annotations();
-  docLock.unlock();
+
+  QList< ::Poppler::Annotation *> popplerAnnots;
+  {
+    // Loading annotations is not thread safe.
+    QMutexLocker popplerDocLock(static_cast<Document *>(_parent)->_poppler_docLock);
+    popplerAnnots = _poppler_page->annotations();
+  }
+
+  // we don't need the docLock anymore
+  docLocker.unlock();
 
   foreach(::Poppler::Annotation * popplerAnnot, popplerAnnots) {
     if (!popplerAnnot)
@@ -567,14 +661,14 @@ QList< QSharedPointer<Annotation::AbstractAnnotation> > Page::loadAnnotations()
       case ::Poppler::Annotation::AText:
       {
         Annotation::Text * annot = new Annotation::Text();
-        convertAnnotation(annot, popplerAnnot, this);
+        convertAnnotation(annot, popplerAnnot, _parent->page(_n));
         _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
         break;
       }
       case ::Poppler::Annotation::ACaret:
       {
         Annotation::Caret * annot = new Annotation::Caret();
-        convertAnnotation(annot, popplerAnnot, this);
+        convertAnnotation(annot, popplerAnnot, _parent->page(_n));
         _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
         break;
       }
@@ -585,28 +679,28 @@ QList< QSharedPointer<Annotation::AbstractAnnotation> > Page::loadAnnotations()
           case ::Poppler::HighlightAnnotation::Highlight:
           {
             Annotation::Highlight * annot = new Annotation::Highlight();
-            convertAnnotation(annot, popplerAnnot, this);
+            convertAnnotation(annot, popplerAnnot, _parent->page(_n));
             _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
             break;
           }
           case ::Poppler::HighlightAnnotation::Squiggly:
           {
             Annotation::Squiggly * annot = new Annotation::Squiggly();
-            convertAnnotation(annot, popplerAnnot, this);
+            convertAnnotation(annot, popplerAnnot, _parent->page(_n));
             _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
             break;
           }
           case ::Poppler::HighlightAnnotation::Underline:
           {
             Annotation::Underline * annot = new Annotation::Underline();
-            convertAnnotation(annot, popplerAnnot, this);
+            convertAnnotation(annot, popplerAnnot, _parent->page(_n));
             _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
             break;
           }
           case ::Poppler::HighlightAnnotation::StrikeOut:
           {
             Annotation::StrikeOut * annot = new Annotation::StrikeOut();
-            convertAnnotation(annot, popplerAnnot, this);
+            convertAnnotation(annot, popplerAnnot, _parent->page(_n));
             _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
             break;
           }
@@ -626,9 +720,14 @@ QList<SearchResult> Page::search(QString searchText)
   SearchResult result;
   double left, right, top, bottom;
 
+  QReadLocker docLocker(_docLock.data());
+  QReadLocker pageLocker(_pageLock);
+  if (!_parent)
+    return results;
+
   result.pageNum = _n;
 
-  QMutexLocker docLock(static_cast<Document *>(_parent)->_doc_lock);
+  QMutexLocker popplerDocLock(static_cast<Document *>(_parent)->_poppler_docLock);
     // The Poppler search function that takes a QRectF has been marked as
     // depreciated---something to do with float <-> double conversion causing
     // infinite loops on some architectures. So, we explicitly use doubles and
@@ -642,13 +741,13 @@ QList<SearchResult> Page::search(QString searchText)
       result.bbox = QRectF(qreal(left), qreal(top), qAbs(qreal(right) - qreal(left)), qAbs(qreal(bottom) - qreal(top)));
       results << result;
     }
-  docLock.unlock();
 
   return results;
 }
 
 void Page::loadTransitionData()
 {
+  QWriteLocker pageLocker(_pageLock);
   Q_ASSERT(!_poppler_page.isNull());
   // Transition
   ::Poppler::PageTransition * poppler_trans = _poppler_page->transition();
@@ -726,14 +825,15 @@ void Page::loadTransitionData()
         _transition->setMotion(Transition::AbstractTransition::Motion_Outward);
       }
     }
-  }  
+  }
 }
 
 QList< Backend::Page::Box > Page::boxes()
 {
+  QReadLocker pageLocker(_pageLock);
   Q_ASSERT(_poppler_page != NULL);
   QList< Backend::Page::Box > retVal;
- 
+
   foreach (::Poppler::TextBox * popplerTextBox, _poppler_page->textList()) {
     if (!popplerTextBox)
       continue;
@@ -755,7 +855,8 @@ QString Page::selectedText(const QList<QPolygonF> & selection)
   // Since poppler doesn't provide a reliable way to extract the text inside (a
   // list of) polygons, we bail out for now
   return QString();
-  
+
+  QReadLocker pageLocker(_pageLock);
   Q_ASSERT(_poppler_page != NULL);
   // Using the bounding rects of the selection polygons is almost
   // certainly wrong! However, poppler-qt4 doesn't offer any alternative AFAICS
@@ -775,11 +876,10 @@ QString Page::selectedText(const QList<QPolygonF> & selection)
   return retVal;
 }
 
-} // namespace Poppler
+} // namespace PopplerQt4
 
 } // namespace Backend
 
 } // namespace QtPDF
 
 // vim: set sw=2 ts=2 et
-

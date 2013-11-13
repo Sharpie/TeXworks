@@ -276,7 +276,7 @@ PDFDestination toPDFDestination(pdf_xref * xref, fz_obj * dest)
 
 
 // TODO: Find a better place to put this
-void initPDFAnnotation(Annotation::AbstractAnnotation * annot, Backend::Page * page, fz_obj * src)
+void initPDFAnnotation(Annotation::AbstractAnnotation * annot, QWeakPointer<Backend::Page> page, fz_obj * src)
 {
   static char keyRect[] = "Rect";
   static char keyContents[] = "Contents";
@@ -316,7 +316,7 @@ Annotation::Popup * toPDFPopupAnnotation(Annotation::Markup * parent, fz_obj * s
   return retVal;
 }
 
-void initPDFMarkupAnnotation(Annotation::Markup * annot, Page * page, fz_obj * src)
+void initPDFMarkupAnnotation(Annotation::Markup * annot, QWeakPointer<Backend::Page> page, fz_obj * src)
 {
   static char keyT[] = "T";
   static char keyRC[] = "RC";
@@ -347,10 +347,12 @@ void initPDFMarkupAnnotation(Annotation::Markup * annot, Page * page, fz_obj * s
 class MuPDFLocaleResetter
 {
   char * _locale;
+  static QMutex * _lock;
 public:
-  MuPDFLocaleResetter() { _locale = setlocale(LC_NUMERIC, NULL); setlocale(LC_NUMERIC, "C"); }
-  ~MuPDFLocaleResetter() { setlocale(LC_NUMERIC, _locale); }
+  MuPDFLocaleResetter() { _lock->lock(); _locale = setlocale(LC_NUMERIC, NULL); setlocale(LC_NUMERIC, "C"); }
+  ~MuPDFLocaleResetter() { _lock->unlock(); setlocale(LC_NUMERIC, _locale); }
 };
+QMutex * MuPDFLocaleResetter::_lock = new QMutex(QMutex::Recursive);
 #else
 class MuPDFLocaleResetter
 {
@@ -367,12 +369,22 @@ Document::Document(QString fileName):
   _mupdf_data(NULL),
   _glyph_cache(fz_new_glyph_cache())
 {
-  _fileName = fileName;
+#ifdef DEBUG
+//  qDebug() << "MuPDF::Document::Document(" << fileName << ")";
+#endif
   reload();
 }
 
 Document::~Document()
 {
+#ifdef DEBUG
+//  qDebug() << "MuPDF::Document::~Document()";
+#endif
+
+  QWriteLocker docLocker(_docLock.data());
+
+  clearPages();
+
   if( _mupdf_data ){
     pdf_free_xref(_mupdf_data);
     _mupdf_data = NULL;
@@ -383,7 +395,12 @@ Document::~Document()
 
 void Document::reload()
 {
+  QWriteLocker docLocker(_docLock.data());
   MuPDFLocaleResetter lr;
+
+  clearPages();
+  _processingThread.clearWorkStack();
+  _pageCache.clear();
 
   if (_mupdf_data) {
     pdf_free_xref(_mupdf_data);
@@ -469,41 +486,61 @@ void Document::reload()
   loadMetaData();
 }
 
-QSharedPointer<Backend::Page> Document::page(int at)
+QWeakPointer<Backend::Page> Document::page(int at)
 {
-  if (at < 0 || at >= _numPages)
-    return QSharedPointer<Backend::Page>();
+  {
+    QReadLocker docLocker(_docLock.data());
+
+    if (at < 0 || at >= _numPages)
+      return QWeakPointer<Backend::Page>();
+
+    if (at < _pages.size() && !_pages[at].isNull())
+      return QWeakPointer<Backend::Page>(_pages[at]);;
+
+    // if we get here, the page is not in the array
+  }
+
+  QWriteLocker docLocker(_docLock.data());
+
+  // recheck everything that could have changed before we got the write lock
+  if (at >= _numPages)
+    return QWeakPointer<Backend::Page>();
+  if (at < _pages.size() && !_pages[at].isNull())
+    return _pages[at].toWeakRef();
 
   if( _pages.isEmpty() )
     _pages.resize(_numPages);
 
-  if( _pages[at].isNull() )
-    _pages[at] = QSharedPointer<Backend::Page>(new Page(this, at));
-
-  return QSharedPointer<Backend::Page>(_pages[at]);
+  _pages[at] = QSharedPointer<Backend::Page>(new Page(this, at, _docLock));
+  return _pages[at].toWeakRef();
 }
 
-QSharedPointer<Backend::Page> Document::page(int at) const
+QWeakPointer<Backend::Page> Document::page(int at) const
 {
-  if (at < 0 || at >= _numPages || at >= _pages.size())
-    return QSharedPointer<Backend::Page>();
+  QReadLocker docLocker(_docLock.data());
 
-  return QSharedPointer<Backend::Page>(_pages[at]);
+  if (at < 0 || at >= _numPages || at >= _pages.size())
+    return QWeakPointer<Backend::Page>();
+
+  return _pages[at];
 }
 
 void Document::loadMetaData()
 {
-  MuPDFLocaleResetter lr;
-
   char infoName[] = "Info"; // required because fz_dict_gets is not prototyped to take const char *
 
-  if (isLocked())
+  QWriteLocker docLocker(_docLock.data());
+  MuPDFLocaleResetter lr;
+
+  if (_isLocked())
     return;
 
   // TODO: Handle encrypted meta data
   // Note: fz_is_dict(NULL)===0, i.e., it doesn't crash
   if (!fz_is_dict(_mupdf_data->trailer))
     return;
+
+  clearMetaData();
   fz_obj * info = fz_dict_gets(_mupdf_data->trailer, infoName);
   if (fz_is_dict(info)) { // the `Info` entry is optional
     for (int i = 0; i < fz_dict_len(info); ++i) {
@@ -557,6 +594,7 @@ void Document::loadMetaData()
 
 PDFDestination Document::resolveDestination(const PDFDestination & namedDestination) const
 {
+  QReadLocker docLocker(_docLock.data());
   MuPDFLocaleResetter lr;
 
   Q_ASSERT(_mupdf_data != NULL);
@@ -578,6 +616,7 @@ PDFDestination Document::resolveDestination(const PDFDestination & namedDestinat
 
 QList<PDFFontInfo> Document::fonts() const
 {
+  QReadLocker docLocker(_docLock.data());
   MuPDFLocaleResetter lr;
 
   int i;
@@ -744,6 +783,7 @@ void Document::recursiveConvertToC(QList<PDFToCItem> & items, pdf_outline * node
 
 PDFToC Document::toc() const
 {
+  QReadLocker docLocker(_docLock.data());
   MuPDFLocaleResetter lr;
 
   PDFToC retVal;
@@ -761,6 +801,8 @@ PDFToC Document::toc() const
 
 bool Document::unlock(const QString password)
 {
+  QWriteLocker docLocker(_docLock.data());
+
   if (!_mupdf_data)
     return false;
 
@@ -781,18 +823,30 @@ bool Document::unlock(const QString password)
 
 // Page Class
 // ==========
-Page::Page(Document *parent, int at):
-  Super(parent, at),
+Page::Page(Document *parent, int at, QSharedPointer<QReadWriteLock> docLock):
+  Super(parent, at, docLock),
   _annotationsLoaded(false),
   _linksLoaded(false)
 {
   MuPDFLocaleResetter lr;
+  QWriteLocker pageLocker(_pageLock);
 
   pdf_page *page_data;
   pdf_load_page(&page_data, parent->_mupdf_data, _n);
 
   _bbox = page_data->mediabox;
   _size = QSizeF(qreal(_bbox.x1 - _bbox.x0), qreal(_bbox.y1 - _bbox.y0));
+  // MuPDF's page_data->mediabox is rounded to integers. _size should be exact,
+  // though.
+  if (parent->_mupdf_data && at >= 0 && at < parent->_mupdf_data->page_len){
+    fz_obj * pageobj = parent->_mupdf_data->page_objs[at];
+    if (pageobj) {
+      static char keyMediaBox[] = "MediaBox";
+      QRectF r(toRectF(fz_dict_gets(pageobj, keyMediaBox)));
+      if (!r.isEmpty())
+        _size = r.size();
+    }
+  }
   _rotate = qreal(page_data->rotate);
 
   // This is also time-intensive. It takes Poppler ~500 ms to create page
@@ -811,15 +865,21 @@ Page::Page(Document *parent, int at):
 
 Page::~Page()
 {
+  QWriteLocker pageLocker(_pageLock);
   if( _mupdf_page )
     fz_free_display_list(_mupdf_page);
   _mupdf_page = NULL;
 }
 
-QSizeF Page::pageSizeF() const { return _size; }
+QSizeF Page::pageSizeF() const { QReadLocker pageLocker(_pageLock); return _size; }
 
 QImage Page::renderToImage(double xres, double yres, QRect render_box, bool cache)
 {
+  QReadLocker docLocker(_docLock.data());
+  QReadLocker pageLocker(_pageLock);
+  if (!_parent)
+    return QImage();
+
   // Set up the transformation matrix for the page. Really, we just start with
   // an identity matrix and scale it using the xres, yres inputs.
   fz_matrix render_trans = fz_identity;
@@ -876,12 +936,21 @@ QImage Page::renderToImage(double xres, double yres, QRect render_box, bool cach
 
 QList< QSharedPointer<Annotation::Link> > Page::loadLinks()
 {
-  MuPDFLocaleResetter lr;
+  {
+    QReadLocker pageLocker(_pageLock);
+    if (_linksLoaded || !_parent)
+      return _links;
+  }
 
-  if (_linksLoaded)
+  QReadLocker docLocker(_docLock.data());
+  QWriteLocker pageLocker(_pageLock);
+
+  // Check if the links were loaded in another thread in the meantime
+  if (_linksLoaded || !_parent)
     return _links;
 
-  Q_ASSERT(_parent != NULL);
+  MuPDFLocaleResetter lr;
+
   pdf_xref * xref = static_cast<Document*>(_parent)->_mupdf_data;
   Q_ASSERT(xref != NULL);
 
@@ -897,7 +966,7 @@ QList< QSharedPointer<Annotation::Link> > Page::loadLinks()
   while (mupdfLink) {
     QSharedPointer<Annotation::Link> link(new Annotation::Link);
     link->setRect(toRectF(mupdfLink->rect));
-    link->setPage(this);
+    link->setPage(_parent->page(_n));
     // TODO: Initialize all other properties of PDFLinkAnnotation, such as
     // border, color, quadPoints, etc.
 
@@ -939,14 +1008,23 @@ QList< QSharedPointer<Annotation::Link> > Page::loadLinks()
 
 QList< QSharedPointer<Annotation::AbstractAnnotation> > Page::loadAnnotations()
 {
+  {
+    QReadLocker pageLocker(_pageLock);
+    if (_annotationsLoaded || !_parent)
+      return _annotations;
+  }
+
+  QReadLocker docLocker(_docLock.data());
+  QWriteLocker pageLocker(_pageLock);
+
+  // Check if the annotations were loaded in another thread in the meantime
+  if (_annotationsLoaded || !_parent)
+    return _annotations;
+
   MuPDFLocaleResetter lr;
   static char keyType[] = "Type";
   static char keySubtype[] = "Subtype";
 
-  if (_annotationsLoaded)
-    return _annotations;
-
-  Q_ASSERT(_parent != NULL);
   pdf_xref * xref = static_cast<Document*>(_parent)->_mupdf_data;
   Q_ASSERT(xref != NULL);
 
@@ -968,37 +1046,37 @@ QList< QSharedPointer<Annotation::AbstractAnnotation> > Page::loadAnnotations()
     QString subtype = QString::fromAscii(fz_to_name(fz_dict_gets(mupdfAnnot->obj, keySubtype)));
     if (subtype == QString::fromAscii("Text")) {
       Annotation::Text * annot = new Annotation::Text();
-      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      initPDFMarkupAnnotation(annot, _parent->page(_n), mupdfAnnot->obj);
       _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
     }
     else if (subtype == QString::fromAscii("FreeText")) {
       Annotation::FreeText * annot = new Annotation::FreeText();
-      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      initPDFMarkupAnnotation(annot, _parent->page(_n), mupdfAnnot->obj);
       _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
     }
     else if (subtype == QString::fromAscii("Caret")) {
       Annotation::Caret * annot = new Annotation::Caret();
-      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      initPDFMarkupAnnotation(annot, _parent->page(_n), mupdfAnnot->obj);
       _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
     }
     else if (subtype == QString::fromAscii("Highlight")) {
       Annotation::Highlight * annot = new Annotation::Highlight();
-      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      initPDFMarkupAnnotation(annot, _parent->page(_n), mupdfAnnot->obj);
       _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
     }
     else if (subtype == QString::fromAscii("Underline")) {
       Annotation::Underline * annot = new Annotation::Underline();
-      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      initPDFMarkupAnnotation(annot, _parent->page(_n), mupdfAnnot->obj);
       _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
     }
     else if (subtype == QString::fromAscii("Squiggly")) {
       Annotation::Squiggly * annot = new Annotation::Squiggly();
-      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      initPDFMarkupAnnotation(annot, _parent->page(_n), mupdfAnnot->obj);
       _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
     }
     else if (subtype == QString::fromAscii("StrikeOut")) {
       Annotation::StrikeOut * annot = new Annotation::StrikeOut();
-      initPDFMarkupAnnotation(annot, this, mupdfAnnot->obj);
+      initPDFMarkupAnnotation(annot, _parent->page(_n), mupdfAnnot->obj);
       _annotations << QSharedPointer<Annotation::AbstractAnnotation>(annot);
     }
     // TODO: Other annotation types (do we need Link annotations here?)
@@ -1014,6 +1092,8 @@ QList<SearchResult> Page::search(QString searchText)
   fz_device * dev;
   QString text;
   int i, j, spanStart;
+
+  QReadLocker pageLocker(_pageLock);
 
   // Use MuPDF transformations to get the text box coordinates right already
   // during fz_execute_display_list().
@@ -1090,10 +1170,12 @@ void Page::loadTransitionData()
   static char keyDi[] = "Di";
   // TODO: SS, B keys
   fz_obj * trans, * tmp;
- 
+
+  if (!_parent)
+    return;
+
   // NOTE: That data is not available in the pdf_page struct - we need to parse
   // the fz_obj ourselves
-  Q_ASSERT(_parent != NULL);
   pdf_xref * xref = static_cast<Document*>(_parent)->_mupdf_data;
   Q_ASSERT(xref != NULL);
   Q_ASSERT(xref->page_len >= _n);
@@ -1171,6 +1253,8 @@ void Page::loadTransitionData()
 
 QList<Backend::Page::Box> Page::boxes()
 {
+  QReadLocker pageLocker(_pageLock);
+
   QList<Backend::Page::Box> retVal;
   if (!_mupdf_page)
     return retVal;
@@ -1226,6 +1310,8 @@ inline bool polygonContains(const QPolygonF & poly, const QRectF & rect)
 
 QString Page::selectedText(const QList<QPolygonF> & selection)
 {
+  QReadLocker pageLocker(_pageLock);
+
   QString retVal;
   if (!_mupdf_page)
     return retVal;
